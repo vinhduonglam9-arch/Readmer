@@ -6,7 +6,9 @@ import {
   BookFormat,
   Chapter,
   FullLibraryBackup,
+  HighlightColor,
   ReaderTheme,
+  ReadingStatsDaily,
 } from '../types/reader';
 
 let mermaidRenderSeq = 0;
@@ -1748,7 +1750,9 @@ export interface TxtExportOptions {
   includeNotes?: boolean;
   includeExcerpts?: boolean;
   includeOutline?: boolean;
+  includeStats?: boolean;
   selectedChapterIds?: string[];
+  dailyStats?: ReadingStatsDaily[];
 }
 
 export function buildTxtExport(
@@ -1763,6 +1767,7 @@ export function buildTxtExport(
           includeNotes: true,
           includeExcerpts: true,
           includeOutline: true,
+          includeStats: true,
           selectedChapterIds: [],
         }
       : includeFullTextOrOpts;
@@ -1771,6 +1776,7 @@ export function buildTxtExport(
   const showNotes = opts.includeNotes ?? true;
   const showExcerpts = opts.includeExcerpts ?? true;
   const showOutline = opts.includeOutline ?? true;
+  const showStats = opts.includeStats ?? false;
   const allChapters =
     book.chapters && book.chapters.length > 0
       ? book.chapters
@@ -1789,6 +1795,25 @@ export function buildTxtExport(
     `================================================`,
     ``,
   ];
+
+  if (showStats) {
+    const progressPct =
+      book.totalChars > 0
+        ? Math.min(100, Math.round((book.currentOffset / book.totalChars) * 100))
+        : 0;
+    const readMinutes = Math.max(1, Math.round((book.readingTimeSeconds || 0) / 60));
+    const notesWithThought = annotations.filter((a) => Boolean(a.noteText && a.noteText.trim())).length;
+    const activeDays = opts.dailyStats ? opts.dailyStats.length : undefined;
+
+    lines.push(
+      `【阅读统计摘要】`,
+      `  · 阅读进度：${progressPct}% (${book.currentOffset.toLocaleString()} / ${book.totalChars.toLocaleString()} 字)`,
+      `  · 累计阅读时长：约 ${readMinutes} 分钟`,
+      `  · 书摘与划线总数：${annotations.length} 条（含随笔感悟 ${notesWithThought} 条）`,
+      ...(activeDays !== undefined ? [`  · 累计活跃阅读天数：${activeDays} 天`] : []),
+      ``
+    );
+  }
 
   if (showOutline && chapters.length > 0) {
     lines.push(`【章节目录大纲 (${chapters.length} 节)】`, ``);
@@ -1858,12 +1883,256 @@ export function triggerFileDownload(filename: string, content: string, mimeType:
   }, 15000);
 }
 
+/**
+ * Extracts book metadata (title, author, category) and clean content from imported
+ * Markdown or plain-text files. Supports YAML frontmatter (`--- ... ---`) exported by
+ * Export Studio as well as common Chinese/English author headers in the opening lines.
+ */
+export function parseImportedBookMetadata(
+  rawText: string,
+  fileName: string,
+  format: BookFormat
+): {
+  title: string;
+  author: string;
+  category: string;
+  content: string;
+} {
+  const fallbackTitle =
+    fileName
+      .replace(/\.(txt|md|markdown)$/i, '')
+      .replace(/^《|》$/g, '')
+      .replace(/_(笔记归档|书摘归档|排印版|精选书摘)$/i, '')
+      .trim() || '未命名书卷';
+
+  let title = fallbackTitle;
+  let author = '本地典藏';
+  let category = format === 'md' ? 'Markdown' : '书卷';
+  let content = rawText.replace(/^\uFEFF/, '');
+
+  // 1. Check for YAML Frontmatter at the beginning of the file
+  const yamlMatch = content.match(/^---\r?\n([\s\S]{1,1600}?)\r?\n---\r?\n+/);
+  if (yamlMatch) {
+    const yamlBlock = yamlMatch[1];
+    const lines = yamlBlock.split(/\r?\n/);
+    let hasRecognizedField = false;
+
+    for (const line of lines) {
+      const kvMatch = line.match(/^\s*([a-zA-Z0-9_-]+)\s*:\s*(.+?)\s*$/);
+      if (!kvMatch) continue;
+      const key = kvMatch[1].toLowerCase();
+      const rawVal = kvMatch[2].replace(/^["']|["']$/g, '').trim();
+      if (!rawVal) continue;
+
+      if (key === 'title') {
+        title = rawVal.replace(/^《|》$/g, '').trim() || title;
+        hasRecognizedField = true;
+      } else if (key === 'author') {
+        author = rawVal;
+        hasRecognizedField = true;
+      } else if (key === 'category' || key === 'tag' || key === 'genre') {
+        category = rawVal;
+        hasRecognizedField = true;
+      }
+    }
+
+    if (hasRecognizedField) {
+      content = content.slice(yamlMatch[0].length);
+    }
+  }
+
+  // 2. Scan first 15 lines for explicit author/category declarations if not set via YAML
+  const headLines = content.slice(0, 1200).split(/\r?\n/).slice(0, 15);
+  for (const rawLine of headLines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // Match Export Studio TXT header line: `作者：xxx  ·  分类：yyy  ·  总字数：...`
+    const combinedMatch = line.match(/^作者[：:]\s*([^\s·|]+)\s*[·|]\s*分类[：:]\s*([^\s·|]+)/);
+    if (combinedMatch) {
+      if (author === '本地典藏') author = combinedMatch[1].trim();
+      if (category === 'Markdown' || category === '书卷') category = combinedMatch[2].trim();
+      continue;
+    }
+
+    if (author === '本地典藏') {
+      const authorMatch = line.match(/^(?:作者|著者|原著|译者|Author)[：:]\s*(.{1,32})$/i);
+      if (authorMatch) {
+        const candidate = authorMatch[1].split(/\s+[·|]\s+/)[0].trim();
+        if (candidate) author = candidate;
+      }
+    }
+
+    if (category === 'Markdown' || category === '书卷') {
+      const categoryMatch = line.match(/^(?:分类|类别|题材|Category)[：:]\s*(.{1,24})$/i);
+      if (categoryMatch) {
+        const candidate = categoryMatch[1].split(/\s+[·|]\s+/)[0].trim();
+        if (candidate) category = candidate;
+      }
+    }
+  }
+
+  return {
+    title,
+    author,
+    category,
+    content,
+  };
+}
+
 export function validateBackupJson(raw: string): FullLibraryBackup | null {
   try {
     const parsed = JSON.parse(raw);
-    if (parsed && Array.isArray(parsed.books) && Array.isArray(parsed.annotations)) {
-      return parsed as FullLibraryBackup;
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    // Case 1: Standard FullLibraryBackup format ({ books: [...], annotations: [...] })
+    // OR Export Studio / Batch Structured JSON format ({ exportedAt, exportConfig, books: [...] })
+    if (Array.isArray(parsed.books)) {
+      const topAnnotations: Annotation[] = Array.isArray(parsed.annotations)
+        ? [...parsed.annotations]
+        : [];
+      const seenAnnIds = new Set<string>(topAnnotations.map((a) => a.id));
+      const normalizedBooks: Book[] = [];
+
+      for (let i = 0; i < parsed.books.length; i++) {
+        const item = parsed.books[i];
+        if (!item || typeof item !== 'object' || typeof item.title !== 'string') continue;
+
+        const bookId =
+          typeof item.id === 'string' && item.id.trim()
+            ? item.id
+            : `imported-json-book-${Date.now()}-${i}`;
+        const format: BookFormat =
+          item.format === 'md' || item.format === 'markdown' ? 'md' : 'txt';
+        const content = typeof item.content === 'string' ? item.content : '';
+        const totalChars =
+          typeof item.totalChars === 'number' && item.totalChars > 0
+            ? item.totalChars
+            : content.length;
+
+        // Reconstruct chapters from either item.chapters or Export Studio's item.outline
+        let chapters: Chapter[] = [];
+        if (Array.isArray(item.chapters) && item.chapters.length > 0) {
+          chapters = item.chapters;
+        } else if (Array.isArray(item.outline) && item.outline.length > 0 && content.length === 0) {
+          let runningOffset = 0;
+          chapters = item.outline.map((ch: any, idx: number) => {
+            const wc = typeof ch.wordCount === 'number' ? ch.wordCount : 0;
+            const chapterObj: Chapter = {
+              id: `ch-${idx}-${runningOffset}`,
+              title: typeof ch.title === 'string' ? ch.title : `第 ${idx + 1} 节`,
+              startOffset: runningOffset,
+              endOffset: runningOffset + wc,
+              wordCount: wc,
+              level: typeof ch.level === 'number' ? ch.level : 1,
+            };
+            runningOffset += wc;
+            return chapterObj;
+          });
+        } else {
+          chapters = extractChapters(content, format);
+        }
+
+        const currentOffset =
+          typeof item.currentOffset === 'number'
+            ? item.currentOffset
+            : typeof item.stats?.progressPercent === 'number' && totalChars > 0
+              ? Math.min(totalChars, Math.round((item.stats.progressPercent / 100) * totalChars))
+              : 0;
+
+        const readingTimeSeconds =
+          typeof item.readingTimeSeconds === 'number'
+            ? item.readingTimeSeconds
+            : typeof item.stats?.readingMinutes === 'number'
+              ? item.stats.readingMinutes * 60
+              : 0;
+
+        normalizedBooks.push({
+          id: bookId,
+          title: item.title,
+          author: typeof item.author === 'string' && item.author.trim() ? item.author : '佚名',
+          category:
+            typeof item.category === 'string' && item.category.trim() ? item.category : '书卷',
+          format,
+          content,
+          totalChars,
+          currentOffset,
+          lastReadAt: typeof item.lastReadAt === 'number' ? item.lastReadAt : Date.now(),
+          addedAt: typeof item.addedAt === 'number' ? item.addedAt : Date.now(),
+          coverPreset: item.coverPreset || 'espresso',
+          chapters,
+          readingTimeSeconds,
+          isFavorite: Boolean(item.isFavorite),
+          encoding: item.encoding || 'UTF-8',
+          ...(item.isPrivate ? { isPrivate: true } : {}),
+          ...(item.encryptedPayload ? { encryptedPayload: item.encryptedPayload } : {}),
+          ...(item.encryptionIv ? { encryptionIv: item.encryptionIv } : {}),
+        });
+
+        // Extract per-book embedded annotations (from buildStructuredJsonExport)
+        if (Array.isArray(item.annotations)) {
+          item.annotations.forEach((ann: any, annIdx: number) => {
+            if (!ann || typeof ann !== 'object') return;
+            const annId =
+              typeof ann.id === 'string' && ann.id.trim()
+                ? ann.id
+                : `imported-ann-${bookId}-${annIdx}-${Date.now()}`;
+            if (seenAnnIds.has(annId)) return;
+            seenAnnIds.add(annId);
+
+            const validColors: HighlightColor[] = ['amber', 'caramel', 'sage'];
+            const color: HighlightColor = validColors.includes(ann.color) ? ann.color : 'amber';
+            const parsedCreatedAt =
+              typeof ann.createdAt === 'number'
+                ? ann.createdAt
+                : typeof ann.createdAt === 'string' && !Number.isNaN(Date.parse(ann.createdAt))
+                  ? Date.parse(ann.createdAt)
+                  : Date.now();
+
+            topAnnotations.push({
+              id: annId,
+              bookId: typeof ann.bookId === 'string' ? ann.bookId : bookId,
+              type: ann.type === 'bookmark' ? 'bookmark' : 'note',
+              chapterTitle: typeof ann.chapterTitle === 'string' ? ann.chapterTitle : '未分章',
+              charOffset: typeof ann.charOffset === 'number' ? ann.charOffset : 0,
+              selectedText: typeof ann.selectedText === 'string' ? ann.selectedText : '',
+              noteText: typeof ann.noteText === 'string' ? ann.noteText : '',
+              color,
+              createdAt: parsedCreatedAt,
+              ...(ann.isPrivate ? { isPrivate: true } : {}),
+              ...(ann.encryptedPayload ? { encryptedPayload: ann.encryptedPayload } : {}),
+              ...(ann.encryptionIv ? { encryptionIv: ann.encryptionIv } : {}),
+            });
+          });
+        }
+      }
+
+      if (normalizedBooks.length === 0 && topAnnotations.length === 0) {
+        return null;
+      }
+
+      return {
+        version: typeof parsed.version === 'string' ? parsed.version : '2.0.0',
+        exportedAt: typeof parsed.exportedAt === 'number' ? parsed.exportedAt : Date.now(),
+        books: normalizedBooks,
+        annotations: topAnnotations,
+        settings: parsed.settings,
+        dailyStats: Array.isArray(parsed.dailyStats) ? parsed.dailyStats : [],
+      };
     }
+
+    // Case 2: Single Book JSON object ({ title, content, ... })
+    if (typeof parsed.title === 'string' && typeof parsed.content === 'string') {
+      return validateBackupJson(
+        JSON.stringify({
+          version: '2.0.0',
+          exportedAt: Date.now(),
+          books: [parsed],
+          annotations: Array.isArray(parsed.annotations) ? parsed.annotations : [],
+        })
+      );
+    }
+
     return null;
   } catch {
     return null;

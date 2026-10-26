@@ -87,6 +87,23 @@ export default defineConfig(() => {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (id.includes('node_modules/mermaid') || id.includes('node_modules/dagre') || id.includes('node_modules/cytoscape') || id.includes('node_modules/katex')) {
+              return 'vendor-mermaid';
+            }
+            if (id.includes('node_modules/jspdf')) {
+              return 'vendor-jspdf';
+            }
+            if (id.includes('node_modules/markdown-it') || id.includes('node_modules/marked')) {
+              return 'vendor-markdown';
+            }
+          },
+        },
+      },
+    },
     server: {
       host: '0.0.0.0',
       port: 3000,
@@ -101,3 +118,4 @@ export default defineConfig(() => {
     },
   };
 });
+

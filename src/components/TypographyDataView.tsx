@@ -1,20 +1,20 @@
 import React, { useRef, useState } from 'react';
 import {
   AlignJustify,
+  AlignLeft,
   ArchiveRestore,
-  BookOpen,
+  Braces,
   Check,
   ChevronDown,
   DatabaseBackup,
   Download,
-  FileCode,
+  Eye,
   FileSpreadsheet,
   FileText,
+  Globe,
   Hash,
   Indent,
   Maximize2,
-  Printer,
-  Sparkles,
   Trash2,
   Type,
   Upload,
@@ -28,17 +28,14 @@ import {
 } from '../types/reader';
 import {
   buildCsvExport,
-  buildEpubBlob,
   buildMarkdownExport,
   buildStructuredJsonExport,
   buildStyledHtmlDocument,
   DEFAULT_EXPORT_CONFIG,
   exportBookWithJsPdf,
   ExportFormat,
-  triggerBlobDownload,
 } from '../core/exportEngine';
 import {
-  buildHtmlNotebookExport,
   buildTxtExport,
   triggerFileDownload,
   warmUpMermaidDiagramsForContent,
@@ -119,14 +116,6 @@ export const TypographyDataView: React.FC<TypographyDataViewProps> = ({
       const md = buildMarkdownExport(selectedBook, bookAnns, dailyStats, cfg);
       triggerFileDownload(`${safeTitle}-手账.md`, md, 'text/markdown');
       showToast('已导出 Markdown (.md) 手账');
-    } else if (format === 'epub') {
-      await warmUpMermaidDiagramsForContent(selectedBook.content, cfg.themeStyle);
-      const blob = buildEpubBlob(selectedBook, bookAnns, dailyStats, {
-        ...cfg,
-        includeFullText: true,
-      });
-      triggerBlobDownload(`${safeTitle}.epub`, blob);
-      showToast('已打包标准 EPUB (.epub) 电子书');
     } else if (format === 'pdf') {
       showToast('正在生成 A4 典藏 PDF 文件...');
       const res = await exportBookWithJsPdf(selectedBook, bookAnns, dailyStats, cfg);
@@ -141,11 +130,18 @@ export const TypographyDataView: React.FC<TypographyDataViewProps> = ({
       showToast('已导出 JSON 结构化数据');
     } else if (format === 'html') {
       await warmUpMermaidDiagramsForContent(selectedBook.content, cfg.themeStyle);
-      const html = buildHtmlNotebookExport(selectedBook, bookAnns, includeFullTextInExport);
+      const html = buildStyledHtmlDocument(selectedBook, bookAnns, dailyStats, cfg);
       triggerFileDownload(`${safeTitle}-手账.html`, html, 'text/html');
       showToast('已导出 HTML 手账');
     } else if (format === 'txt') {
-      const txt = buildTxtExport(selectedBook, bookAnns, includeFullTextInExport);
+      const txt = buildTxtExport(selectedBook, bookAnns, {
+        includeFullText: includeFullTextInExport,
+        includeNotes: true,
+        includeExcerpts: true,
+        includeOutline: true,
+        includeStats: true,
+        dailyStats,
+      });
       triggerFileDownload(`${safeTitle}-笔记.txt`, txt, 'text/plain');
       showToast('已导出 TXT 笔记');
     }
@@ -584,7 +580,7 @@ export const TypographyDataView: React.FC<TypographyDataViewProps> = ({
             </div>
           </div>
 
-          {/* Multi-Format Book Export Card */}
+          {/* Multi-Format Book Export Card (Icon-First Dock) */}
           <div
             className="rounded-2xl p-5"
             style={{
@@ -595,31 +591,59 @@ export const TypographyDataView: React.FC<TypographyDataViewProps> = ({
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Download className="h-5 w-5" style={{ color: 'var(--accent-primary)' }} />
-                <h2 className="font-display text-base font-semibold">多格式手账与电子书导出</h2>
+                <h2 className="font-display text-base font-semibold">多格式导出</h2>
               </div>
-              <label
-                className="flex cursor-pointer items-center gap-1.5 text-xs"
-                style={{ color: 'var(--text-secondary)' }}
-              >
-                <input
-                  type="checkbox"
-                  checked={includeFullTextInExport}
-                  onChange={(e) => setIncludeFullTextInExport(e.target.checked)}
-                  className="h-3.5 w-3.5 accent-[#B4532A]"
-                />
-                <span>含全文</span>
-              </label>
+
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setIncludeFullTextInExport((v) => !v)}
+                  className="flex h-8 items-center gap-1 rounded-lg px-2.5 text-xs font-medium transition-colors"
+                  style={{
+                    backgroundColor: includeFullTextInExport
+                      ? 'var(--accent-soft)'
+                      : 'var(--bg-surface)',
+                    color: includeFullTextInExport
+                      ? 'var(--accent-primary)'
+                      : 'var(--text-secondary)',
+                    border: includeFullTextInExport
+                      ? '1px solid var(--accent-primary)'
+                      : '1px solid var(--border-subtle)',
+                  }}
+                  title={
+                    includeFullTextInExport
+                      ? '当前：导出包含全书正文（点击切换为仅书摘笔记）'
+                      : '当前：仅导出书摘与笔记（点击切换为包含全书正文）'
+                  }
+                  aria-pressed={includeFullTextInExport}
+                >
+                  <FileText className="h-3.5 w-3.5" />
+                  <span>{includeFullTextInExport ? '含正文' : '仅书摘'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setStudioModalFormat('pdf')}
+                  className="flex h-8 w-8 items-center justify-center rounded-lg text-white transition-transform active:scale-95"
+                  style={{ backgroundColor: 'var(--accent-primary)' }}
+                  title="打开排版预览与章节筛选工作台"
+                  aria-label="打开导出工作台"
+                >
+                  <Eye className="h-3.5 w-3.5" />
+                </button>
+              </div>
             </div>
 
             <select
               value={selectedExportBookId}
               onChange={(e) => setSelectedExportBookId(e.target.value)}
-              className="mt-3 h-10 w-full rounded-xl px-3 text-xs outline-none"
+              className="mt-3 h-9 w-full rounded-xl px-3 text-xs outline-none"
               style={{
                 backgroundColor: 'var(--bg-surface)',
                 border: '1px solid var(--border-subtle)',
                 color: 'var(--text-primary)',
               }}
+              title="选择要导出的书籍"
             >
               {books.map((b) => (
                 <option key={b.id} value={b.id}>
@@ -628,90 +652,48 @@ export const TypographyDataView: React.FC<TypographyDataViewProps> = ({
               ))}
             </select>
 
-            <div className="mt-3 grid grid-cols-3 gap-2">
-              <button
-                onClick={() => handleQuickExportFormat('md')}
-                className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-medium"
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  color: 'var(--text-primary)',
-                  border: '1px solid var(--border-strong)',
-                }}
-              >
-                <Hash className="h-3.5 w-3.5" style={{ color: 'var(--accent-primary)' }} />
-                <span>MD</span>
-              </button>
-              <button
-                onClick={() => handleQuickExportFormat('epub')}
-                className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-medium"
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  color: 'var(--text-primary)',
-                  border: '1px solid var(--border-strong)',
-                }}
-              >
-                <BookOpen className="h-3.5 w-3.5" style={{ color: 'var(--accent-primary)' }} />
-                <span>EPUB</span>
-              </button>
-              <button
-                onClick={() => handleQuickExportFormat('pdf')}
-                className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-medium"
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  color: 'var(--text-primary)',
-                  border: '1px solid var(--border-strong)',
-                }}
-              >
-                <Printer className="h-3.5 w-3.5" style={{ color: 'var(--accent-primary)' }} />
-                <span>PDF</span>
-              </button>
-              <button
-                onClick={() => handleQuickExportFormat('csv')}
-                className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-medium"
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  color: 'var(--text-primary)',
-                  border: '1px solid var(--border-strong)',
-                }}
-              >
-                <FileSpreadsheet className="h-3.5 w-3.5" style={{ color: 'var(--accent-primary)' }} />
-                <span>CSV</span>
-              </button>
-              <button
-                onClick={() => handleQuickExportFormat('html')}
-                className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-medium"
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  color: 'var(--text-primary)',
-                  border: '1px solid var(--border-strong)',
-                }}
-              >
-                <FileCode className="h-3.5 w-3.5" style={{ color: 'var(--accent-primary)' }} />
-                <span>HTML</span>
-              </button>
-              <button
-                onClick={() => handleQuickExportFormat('txt')}
-                className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-medium"
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  color: 'var(--text-primary)',
-                  border: '1px solid var(--border-strong)',
-                }}
-              >
-                <FileText className="h-3.5 w-3.5" style={{ color: 'var(--accent-primary)' }} />
-                <span>TXT</span>
-              </button>
+            {/* 6-Format Single-Row Icon Dock */}
+            <div className="mt-3 grid grid-cols-6 gap-1.5">
+              {(
+                [
+                  { id: 'pdf', label: 'PDF', tip: '一键下载矢量 PDF', icon: FileText },
+                  { id: 'md', label: 'MD', tip: '一键导出 Markdown 手账', icon: Hash },
+                  { id: 'html', label: 'HTML', tip: '一键导出网页手账', icon: Globe },
+                  { id: 'txt', label: 'TXT', tip: '一键导出纯文本笔记', icon: AlignLeft },
+                  { id: 'csv', label: 'CSV', tip: '一键导出 CSV 统计表', icon: FileSpreadsheet },
+                  { id: 'json', label: 'JSON', tip: '一键导出 JSON 数据包', icon: Braces },
+                ] as {
+                  id: ExportFormat;
+                  label: string;
+                  tip: string;
+                  icon: React.FC<{ className?: string; style?: React.CSSProperties }>;
+                }[]
+              ).map((fmt) => {
+                const Icon = fmt.icon;
+                return (
+                  <button
+                    key={fmt.id}
+                    type="button"
+                    onClick={() => handleQuickExportFormat(fmt.id)}
+                    className="group flex flex-col items-center justify-center gap-1 rounded-xl py-2.5 transition-all hover:opacity-90 active:scale-95"
+                    style={{
+                      backgroundColor: 'var(--bg-surface)',
+                      color: 'var(--text-primary)',
+                      border: '1px solid var(--border-subtle)',
+                    }}
+                    title={fmt.tip}
+                  >
+                    <Icon
+                      className="h-4 w-4 transition-transform group-hover:-translate-y-0.5"
+                      style={{ color: 'var(--accent-primary)' }}
+                    />
+                    <span className="font-mono-tabular text-[10px] font-semibold leading-none">
+                      {fmt.label}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
-
-            <button
-              type="button"
-              onClick={() => setStudioModalFormat('pdf')}
-              className="mt-2.5 flex min-h-[40px] w-full items-center justify-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold text-white"
-              style={{ backgroundColor: 'var(--accent-primary)' }}
-            >
-              <Sparkles className="h-3.5 w-3.5" />
-              <span>打开定制导出工作台（自由勾选章节与实时预览）</span>
-            </button>
           </div>
         </div>
       </div>
@@ -725,6 +707,7 @@ export const TypographyDataView: React.FC<TypographyDataViewProps> = ({
           annotations={annotations}
           dailyStats={dailyStats}
           initialFormat={studioModalFormat}
+          initialConfig={{ includeFullText: includeFullTextInExport }}
         />
       )}
     </div>

@@ -1,20 +1,27 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-  BookOpen,
+  AlignLeft,
+  BarChart3,
+  Braces,
   Check,
+  CheckCheck,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Copy,
   Download,
-  FileCode,
   FileSpreadsheet,
   FileText,
+  Globe,
   Hash,
-  Layers,
-  ListChecks,
+  ListFilter,
+  ListTree,
+  Loader2,
+  MessageSquareQuote,
   Palette,
   Printer,
-  Sparkles,
+  Quote,
+  RotateCcw,
   Type,
   X,
   ZoomIn,
@@ -23,7 +30,6 @@ import {
 import { Annotation, Book, ReadingStatsDaily } from '../types/reader';
 import {
   buildCsvExport,
-  buildEpubBlob,
   buildMarkdownExport,
   buildStructuredJsonExport,
   buildStyledHtmlDocument,
@@ -36,7 +42,6 @@ import {
   getFilteredChaptersForBook,
   printDocumentViaHiddenIframe,
   renderJsPdfPages,
-  triggerBlobDownload,
   warmUpCjkPdfFont,
 } from '../core/exportEngine';
 import {
@@ -59,60 +64,75 @@ interface ExportStudioModalProps {
 
 const FORMAT_OPTIONS: {
   id: ExportFormat;
-  label: string;
+  shortLabel: string;
   ext: string;
-  desc: string;
+  tooltip: string;
   icon: React.FC<{ className?: string }>;
 }[] = [
   {
     id: 'pdf',
-    label: '矢量文字 PDF',
+    shortLabel: 'PDF',
     ext: '.pdf',
-    desc: 'A4 矢量排版、含 Mermaid 图表与表格',
+    tooltip: '矢量排版 PDF（A4 页眉页脚、含 Mermaid 图表与表格）',
     icon: FileText,
   },
   {
     id: 'md',
-    label: 'Markdown 手账',
+    shortLabel: 'MD',
     ext: '.md',
-    desc: '含 YAML 头、多级大纲与批注',
+    tooltip: 'Markdown 读书手账（含 YAML 元数据、大纲与批注）',
     icon: Hash,
   },
   {
-    id: 'epub',
-    label: 'EPUB 电子书',
-    ext: '.epub',
-    desc: '标准 EPUB 3 打包章节与图表',
-    icon: BookOpen,
+    id: 'html',
+    shortLabel: 'HTML',
+    ext: '.html',
+    tooltip: '独立单文件暖调网页手账（内嵌 SVG 图表）',
+    icon: Globe,
+  },
+  {
+    id: 'txt',
+    shortLabel: 'TXT',
+    ext: '.txt',
+    tooltip: '纯文本书摘与全文归档',
+    icon: AlignLeft,
   },
   {
     id: 'csv',
-    label: 'CSV 统计报表',
+    shortLabel: 'CSV',
     ext: '.csv',
-    desc: 'Excel / Notion 兼容结构化表',
+    tooltip: 'Excel / Notion 兼容结构化书摘统计表',
     icon: FileSpreadsheet,
   },
   {
     id: 'json',
-    label: 'JSON 结构数据',
+    shortLabel: 'JSON',
     ext: '.json',
-    desc: '大纲、书摘与统计结构化导出',
-    icon: FileCode,
+    tooltip: '结构化 JSON 数据包（大纲、书摘与统计）',
+    icon: Braces,
   },
-  {
-    id: 'html',
-    label: 'HTML 网页手账',
-    ext: '.html',
-    desc: '独立单文件暖调排版与矢量图',
-    icon: Layers,
-  },
-  {
-    id: 'txt',
-    label: 'TXT 纯文本',
-    ext: '.txt',
-    desc: '经典纯文本书摘与全文归档',
-    icon: FileText,
-  },
+];
+
+const THEME_SWATCHES: {
+  id: ExportThemeStyle;
+  label: string;
+  hex: string;
+  ringHex: string;
+}[] = [
+  { id: 'parchment', label: '羊皮纸', hex: '#FBF7F0', ringHex: '#B4532A' },
+  { id: 'caramel', label: '焦糖拿铁', hex: '#F2E3CE', ringHex: '#9A3F1C' },
+  { id: 'espresso', label: '浓缩夜读', hex: '#211A15', ringHex: '#D97724' },
+  { id: 'eink', label: '电子墨水', hex: '#F4F4F4', ringHex: '#222222' },
+];
+
+const FONT_PILLS: {
+  id: 'serif' | 'kaiti' | 'sans';
+  short: string;
+  tooltip: string;
+}[] = [
+  { id: 'serif', short: '宋', tooltip: '人文宋体（衬线典藏）' },
+  { id: 'kaiti', short: '楷', tooltip: '书房楷体（温润手书）' },
+  { id: 'sans', short: '黑', tooltip: '现代黑体（清晰无衬线）' },
 ];
 
 export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
@@ -133,6 +153,8 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
   });
   const [showChapterPicker, setShowChapterPicker] = useState(false);
   const [statusToast, setStatusToast] = useState<string | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
+  const [copiedFlag, setCopiedFlag] = useState(false);
   const [pdfPreviewPageIdx, setPdfPreviewPageIdx] = useState<number>(0);
   const [pdfZoomFit, setPdfZoomFit] = useState<boolean>(true);
   const [mermaidReadyTick, setMermaidReadyTick] = useState<number>(0);
@@ -163,7 +185,7 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
     return book;
   }, [allBooks, selectedBookId, book]);
 
-  // Pre-warm all Mermaid diagrams in the active book whenever modal opens or theme changes
+  // Pre-warm Mermaid diagrams in the active book when modal opens or theme changes
   useEffect(() => {
     if (!isOpen || !activeBook?.content) return;
     let cancelled = false;
@@ -205,7 +227,6 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
     [activeBook, config.selectedChapterIds]
   );
 
-  // Live jsPDF multi-page A4 vector preview (renders 100% of book pages to match exported PDF)
   const jsPdfPreview = useMemo(() => {
     if (!isOpen || config.format !== 'pdf') {
       return null;
@@ -219,13 +240,32 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
     }
   }, [jsPdfPreview, pdfPreviewPageIdx]);
 
+  // Keyboard navigation inside modal (Esc to close, Left/Right for PDF preview pages)
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+      } else if (config.format === 'pdf' && jsPdfPreview) {
+        if (e.key === 'ArrowLeft') {
+          setPdfPreviewPageIdx((p) => Math.max(0, p - 1));
+        } else if (e.key === 'ArrowRight') {
+          setPdfPreviewPageIdx((p) => Math.min(jsPdfPreview.totalPages - 1, p + 1));
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [isOpen, onClose, config.format, jsPdfPreview]);
+
   const previewText = useMemo(() => {
-    if (!isOpen) return '';
+    if (!isOpen || config.format === 'pdf') return '';
     const syncedConfig: ExportConfig = {
       ...config,
       includeAnnotations: Boolean(config.includeNotes || config.includeExcerpts),
     };
-    if (config.format === 'md' || config.format === 'epub') {
+    if (config.format === 'md') {
       return buildMarkdownExport(activeBook, bookAnnotations, dailyStats, syncedConfig);
     }
     if (config.format === 'csv') {
@@ -240,7 +280,9 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
         includeNotes: syncedConfig.includeNotes,
         includeExcerpts: syncedConfig.includeExcerpts,
         includeOutline: syncedConfig.includeOutline,
+        includeStats: syncedConfig.includeStats,
         selectedChapterIds: syncedConfig.selectedChapterIds,
+        dailyStats,
       });
     }
     return buildStyledHtmlDocument(activeBook, bookAnnotations, dailyStats, syncedConfig);
@@ -250,7 +292,7 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
 
   const triggerNotice = (msg: string) => {
     setStatusToast(msg);
-    setTimeout(() => setStatusToast(null), 2800);
+    setTimeout(() => setStatusToast(null), 2600);
   };
 
   const toggleChapterSelection = (chId: string) => {
@@ -266,75 +308,83 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
         selectedChapterIds: next.length === bookChapters.length ? [] : next,
       };
     });
+    setPdfPreviewPageIdx(0);
   };
 
   const handlePrimaryExport = async () => {
-    const safeTitle = activeBook.title.replace(/[\\/:*?"<>|]/g, '');
-    const syncedConfig: ExportConfig = {
-      ...config,
-      includeAnnotations: Boolean(config.includeNotes || config.includeExcerpts),
-    };
+    if (isExporting) return;
+    setIsExporting(true);
+    try {
+      const safeTitle = activeBook.title.replace(/[\\/:*?"<>|]/g, '');
+      const syncedConfig: ExportConfig = {
+        ...config,
+        includeAnnotations: Boolean(config.includeNotes || config.includeExcerpts),
+      };
 
-    if (config.format === 'pdf') {
-      triggerNotice('正在渲染全书 Mermaid 图表并生成矢量 PDF...');
-      const result = await exportBookWithJsPdf(
-        activeBook,
-        bookAnnotations,
-        dailyStats,
-        syncedConfig
-      );
-      triggerNotice(`已完整导出 ${result.totalPages} 页 A4 矢量 PDF（含全部图表）`);
-      return;
-    }
+      if (config.format === 'pdf') {
+        triggerNotice('正在生成矢量 PDF...');
+        const result = await exportBookWithJsPdf(
+          activeBook,
+          bookAnnotations,
+          dailyStats,
+          syncedConfig
+        );
+        triggerNotice(`已导出 ${result.totalPages} 页 PDF`);
+        return;
+      }
 
-    if (config.format === 'md') {
-      const md = buildMarkdownExport(activeBook, bookAnnotations, dailyStats, syncedConfig);
-      triggerFileDownload(`${safeTitle}-读书手账.md`, md, 'text/markdown');
-      triggerNotice('已导出 Markdown (.md) 读书手账');
-      return;
-    }
+      if (config.format === 'md') {
+        const md = buildMarkdownExport(activeBook, bookAnnotations, dailyStats, syncedConfig);
+        triggerFileDownload(`${safeTitle}-手账.md`, md, 'text/markdown');
+        triggerNotice('已导出 .md');
+        return;
+      }
 
-    if (config.format === 'epub') {
-      triggerNotice('正在渲染 Mermaid 矢量图表并打包 EPUB...');
-      await warmUpMermaidDiagramsForContent(activeBook.content, syncedConfig.themeStyle);
-      const epubBlob = buildEpubBlob(activeBook, bookAnnotations, dailyStats, syncedConfig);
-      triggerBlobDownload(`${safeTitle}.epub`, epubBlob);
-      triggerNotice('已打包导出标准 EPUB (.epub) 电子书（含图表与表格）');
-      return;
-    }
+      if (config.format === 'csv') {
+        const csv = buildCsvExport([activeBook], bookAnnotations, dailyStats);
+        triggerFileDownload(`${safeTitle}-报表.csv`, csv, 'text/csv');
+        triggerNotice('已导出 .csv');
+        return;
+      }
 
-    if (config.format === 'csv') {
-      const csv = buildCsvExport([activeBook], bookAnnotations, dailyStats);
-      triggerFileDownload(`${safeTitle}-书摘统计报表.csv`, csv, 'text/csv');
-      triggerNotice('已导出 CSV 结构化报表');
-      return;
-    }
+      if (config.format === 'json') {
+        const json = buildStructuredJsonExport(
+          [activeBook],
+          bookAnnotations,
+          dailyStats,
+          syncedConfig
+        );
+        triggerFileDownload(`${safeTitle}-归档.json`, json, 'application/json');
+        triggerNotice('已导出 .json');
+        return;
+      }
 
-    if (config.format === 'json') {
-      const json = buildStructuredJsonExport([activeBook], bookAnnotations, dailyStats, syncedConfig);
-      triggerFileDownload(`${safeTitle}-结构化归档.json`, json, 'application/json');
-      triggerNotice('已导出 JSON 结构化数据');
-      return;
-    }
+      if (config.format === 'html') {
+        await warmUpMermaidDiagramsForContent(activeBook.content, syncedConfig.themeStyle);
+        const html = buildStyledHtmlDocument(
+          activeBook,
+          bookAnnotations,
+          dailyStats,
+          syncedConfig
+        );
+        triggerFileDownload(`${safeTitle}-手账.html`, html, 'text/html');
+        triggerNotice('已导出 .html');
+        return;
+      }
 
-    if (config.format === 'html') {
-      await warmUpMermaidDiagramsForContent(activeBook.content, syncedConfig.themeStyle);
-      const html = buildStyledHtmlDocument(activeBook, bookAnnotations, dailyStats, syncedConfig);
-      triggerFileDownload(`${safeTitle}-典藏手账.html`, html, 'text/html');
-      triggerNotice('已导出 HTML 典藏网页手账（含内嵌 SVG 图表）');
-      return;
-    }
-
-    if (config.format === 'txt') {
-      const txt = buildTxtExport(activeBook, bookAnnotations, {
-        includeFullText: config.includeFullText,
-        includeNotes: syncedConfig.includeNotes,
-        includeExcerpts: syncedConfig.includeExcerpts,
-        includeOutline: syncedConfig.includeOutline,
-        selectedChapterIds: syncedConfig.selectedChapterIds,
-      });
-      triggerFileDownload(`${safeTitle}-读书笔记.txt`, txt, 'text/plain');
-      triggerNotice('已导出 TXT 读书笔记');
+      if (config.format === 'txt') {
+        const txt = buildTxtExport(activeBook, bookAnnotations, {
+          includeFullText: config.includeFullText,
+          includeNotes: syncedConfig.includeNotes,
+          includeExcerpts: syncedConfig.includeExcerpts,
+          includeOutline: syncedConfig.includeOutline,
+          selectedChapterIds: syncedConfig.selectedChapterIds,
+        });
+        triggerFileDownload(`${safeTitle}-笔记.txt`, txt, 'text/plain');
+        triggerNotice('已导出 .txt');
+      }
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -343,7 +393,7 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
       ...config,
       includeAnnotations: Boolean(config.includeNotes || config.includeExcerpts),
     };
-    triggerNotice('正在准备 100% 图表与全书矢量打印排版...');
+    triggerNotice('正在唤起矢量打印...');
     await warmUpMermaidDiagramsForContent(activeBook.content, syncedConfig.themeStyle);
     if (config.format === 'pdf') {
       const fullResult = renderJsPdfPages(
@@ -354,20 +404,27 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
         Infinity
       );
       printDocumentViaHiddenIframe(fullResult.vectorPrintHtml);
-      triggerNotice(`已唤起全书 ${fullResult.totalPages} 页 A4 矢量打印视图`);
       return;
     }
     const html = buildStyledHtmlDocument(activeBook, bookAnnotations, dailyStats, syncedConfig);
     printDocumentViaHiddenIframe(html);
-    triggerNotice('已唤起无页眉原生矢量打印视图');
   };
 
   const handleCopyContent = async () => {
     try {
-      await navigator.clipboard.writeText(previewText);
-      triggerNotice('已复制导出内容至剪贴板');
+      const textToCopy =
+        config.format === 'pdf'
+          ? buildMarkdownExport(activeBook, bookAnnotations, dailyStats, {
+              ...config,
+              includeAnnotations: Boolean(config.includeNotes || config.includeExcerpts),
+            })
+          : previewText;
+      await navigator.clipboard.writeText(textToCopy);
+      setCopiedFlag(true);
+      triggerNotice('已复制至剪贴板');
+      setTimeout(() => setCopiedFlag(false), 1800);
     } catch {
-      triggerNotice('复制失败，请直接点击下载');
+      triggerNotice('复制失败');
     }
   };
 
@@ -376,13 +433,61 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
       ? Math.max(48, jsPdfPreview.totalPages * 115)
       : Math.max(1, Math.round(new Blob([previewText]).size / 1024));
 
+  const currentFormatMeta =
+    FORMAT_OPTIONS.find((f) => f.id === config.format) || FORMAT_OPTIONS[0];
+
+  const contentModules = [
+    {
+      key: 'includeFullText' as const,
+      label: '正文',
+      badge: `${(activeBook.totalChars / 1000).toFixed(0)}k`,
+      tooltip: `包含书籍正文 (${activeBook.totalChars.toLocaleString()} 字)`,
+      icon: FileText,
+      active: Boolean(config.includeFullText),
+    },
+    {
+      key: 'includeNotes' as const,
+      label: '笔记',
+      badge: `${notesCount}`,
+      tooltip: `包含批注笔记 (${notesCount} 条感悟)`,
+      icon: MessageSquareQuote,
+      active: Boolean(config.includeNotes ?? config.includeAnnotations),
+    },
+    {
+      key: 'includeExcerpts' as const,
+      label: '书摘',
+      badge: `${bookAnnotations.length}`,
+      tooltip: `包含高亮书摘 (${bookAnnotations.length} 处划线)`,
+      icon: Quote,
+      active: Boolean(config.includeExcerpts ?? config.includeAnnotations),
+    },
+    {
+      key: 'includeOutline' as const,
+      label: '大纲',
+      badge: `${bookChapters.length}`,
+      tooltip: `包含章节目录 (${bookChapters.length} 节)`,
+      icon: ListTree,
+      active: Boolean(config.includeOutline),
+    },
+    {
+      key: 'includeStats' as const,
+      label: '统计',
+      badge: `${metrics.progressPct}%`,
+      tooltip: `包含阅读进度与用时统计 (${metrics.progressPct}%)`,
+      icon: BarChart3,
+      active: Boolean(config.includeStats),
+    },
+  ];
+
+  const isAllModulesChecked = contentModules.every((m) => m.active);
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-3 backdrop-blur-xs sm:p-6"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-2.5 backdrop-blur-xs sm:p-5"
       onClick={onClose}
     >
       <div
-        className="flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl shadow-2xl lg:flex-row"
+        className="flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl shadow-2xl lg:h-[82vh] lg:flex-row"
         style={{
           backgroundColor: 'var(--bg-page)',
           border: '1px solid var(--border-strong)',
@@ -390,74 +495,109 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Left Control Column */}
+        {/* Left Compact Icon-Driven Inspector Sidebar */}
         <div
-          className="flex max-h-[46vh] w-full flex-col justify-between border-b p-4 sm:p-5 lg:max-h-none lg:w-96 lg:shrink-0 lg:border-r lg:border-b-0"
+          className="flex max-h-[48vh] w-full flex-col justify-between border-b p-4 lg:max-h-none lg:w-80 lg:shrink-0 lg:border-r lg:border-b-0"
           style={{
             backgroundColor: 'var(--bg-surface)',
             borderColor: 'var(--border-subtle)',
           }}
         >
-          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-0.5">
+            {/* Compact Header */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <Download className="h-4 w-4" style={{ color: 'var(--accent-primary)' }} />
-                <h2 className="font-display text-base font-semibold">PDF 与多格式导出工坊</h2>
-              </div>
-              <button
-                type="button"
-                onClick={onClose}
-                className="flex h-7 w-7 items-center justify-center rounded-lg lg:hidden"
-                style={{ color: 'var(--text-muted)' }}
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            {/* Book Selector (if multiple books provided) */}
-            {allBooks && allBooks.length > 1 && (
-              <div>
-                <label
-                  className="mb-1 block text-xs font-medium"
-                  style={{ color: 'var(--text-secondary)' }}
+                <div
+                  className="flex h-7 w-7 items-center justify-center rounded-lg"
+                  style={{
+                    backgroundColor: 'var(--accent-soft)',
+                    color: 'var(--accent-primary)',
+                  }}
                 >
-                  目标典藏书籍
-                </label>
-                <select
-                  value={activeBook.id}
-                  onChange={(e) => {
-                    setSelectedBookId(e.target.value);
-                    setConfig((prev) => ({ ...prev, selectedChapterIds: [] }));
+                  <Download className="h-3.5 w-3.5" />
+                </div>
+                <h2 className="font-display text-sm font-semibold tracking-tight">导出工作台</h2>
+              </div>
+
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setConfig({
+                      ...DEFAULT_EXPORT_CONFIG,
+                      format: config.format,
+                    });
                     setPdfPreviewPageIdx(0);
                   }}
-                  className="h-9 w-full rounded-xl px-3 text-xs outline-none"
+                  className="flex h-7 w-7 items-center justify-center rounded-lg transition-colors hover:opacity-80"
                   style={{
                     backgroundColor: 'var(--bg-page)',
+                    color: 'var(--text-muted)',
                     border: '1px solid var(--border-subtle)',
-                    color: 'var(--text-primary)',
                   }}
+                  title="重置导出选项"
+                  aria-label="重置导出选项"
                 >
-                  {allBooks.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      《{b.title}》 ({b.totalChars.toLocaleString()} 字)
-                    </option>
-                  ))}
-                </select>
+                  <RotateCcw className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="flex h-7 w-7 items-center justify-center rounded-lg lg:hidden"
+                  style={{ color: 'var(--text-muted)' }}
+                  title="关闭 (Esc)"
+                  aria-label="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </button>
               </div>
+            </div>
+
+            {/* Book Selector (only when invoked from studio with multiple books) */}
+            {allBooks && allBooks.length > 1 && (
+              <select
+                value={activeBook.id}
+                onChange={(e) => {
+                  setSelectedBookId(e.target.value);
+                  setConfig((prev) => ({ ...prev, selectedChapterIds: [] }));
+                  setPdfPreviewPageIdx(0);
+                }}
+                className="h-9 w-full rounded-xl px-3 text-xs font-medium outline-none"
+                style={{
+                  backgroundColor: 'var(--bg-page)',
+                  border: '1px solid var(--border-subtle)',
+                  color: 'var(--text-primary)',
+                }}
+                title="切换导出书籍"
+              >
+                {allBooks.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    《{b.title}》 ({(b.totalChars / 1000).toFixed(1)}k字)
+                  </option>
+                ))}
+              </select>
             )}
 
-            {/* 7 Export Formats Grid */}
+            {/* 1. 6-Format Compact Icon Dock */}
             <div>
               <div
-                className="mb-1.5 flex items-center justify-between text-xs font-medium"
-                style={{ color: 'var(--text-secondary)' }}
+                className="mb-1.5 flex items-center justify-between text-[11px]"
+                style={{ color: 'var(--text-muted)' }}
               >
-                <span>选择导出格式</span>
-                <span className="font-mono-tabular text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                  jsPDF 驱动
+                <span>格式</span>
+                <span className="truncate max-w-[190px]" style={{ color: 'var(--text-secondary)' }}>
+                  {currentFormatMeta.tooltip.split('（')[0]}
                 </span>
               </div>
-              <div className="grid grid-cols-2 gap-1.5">
+              <div
+                className="grid grid-cols-6 gap-1 rounded-xl p-1"
+                style={{
+                  backgroundColor: 'var(--bg-page)',
+                  border: '1px solid var(--border-subtle)',
+                }}
+                role="tablist"
+                aria-label="选择导出格式"
+              >
                 {FORMAT_OPTIONS.map((fmt) => {
                   const Icon = fmt.icon;
                   const active = config.format === fmt.id;
@@ -465,513 +605,497 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
                     <button
                       key={fmt.id}
                       type="button"
+                      role="tab"
+                      aria-selected={active}
                       onClick={() => setConfig((prev) => ({ ...prev, format: fmt.id }))}
-                      className="flex items-start gap-2 rounded-xl p-2.5 text-left transition-all"
+                      className="flex flex-col items-center justify-center gap-1 rounded-lg py-2 transition-all"
                       style={{
-                        backgroundColor: active ? 'var(--accent-primary)' : 'var(--bg-page)',
-                        color: active ? '#FFFFFF' : 'var(--text-primary)',
-                        border: '1px solid var(--border-subtle)',
+                        backgroundColor: active ? 'var(--accent-primary)' : 'transparent',
+                        color: active ? '#FFFFFF' : 'var(--text-secondary)',
                       }}
+                      title={fmt.tooltip}
                     >
-                      <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-1 text-xs font-semibold">
-                          <span className="truncate">{fmt.label}</span>
-                        </div>
-                        <p
-                          className="mt-0.5 truncate text-[10px]"
-                          style={{
-                            color: active ? 'rgba(255,255,255,0.82)' : 'var(--text-muted)',
-                          }}
-                        >
-                          {fmt.desc}
-                        </p>
-                      </div>
+                      <Icon className="h-3.5 w-3.5 shrink-0" />
+                      <span className="font-mono-tabular text-[10px] font-semibold leading-none">
+                        {fmt.shortLabel}
+                      </span>
                     </button>
                   );
                 })}
               </div>
             </div>
 
-            {/* Granular Content Selection: 正文 / 笔记 / 书摘 / 大纲 / 统计 */}
+            {/* 2. 5-Dimension Icon Toggle Dock (正文 / 笔记 / 书摘 / 大纲 / 统计) */}
             <div>
-              <div
-                className="mb-1.5 flex items-center justify-between text-xs font-medium"
-                style={{ color: 'var(--text-secondary)' }}
-              >
-                <span className="flex items-center gap-1.5">
-                  <ListChecks className="h-3.5 w-3.5" />
-                  <span>选择导出内容（正文 / 笔记 / 书摘）</span>
-                </span>
-              </div>
-
-              {/* Primary 3 Core Dimensions: 正文, 笔记, 书摘 */}
-              <div className="grid grid-cols-3 gap-1.5">
-                {[
-                  {
-                    key: 'includeFullText' as const,
-                    label: '正文',
-                    sub: `${(activeBook.totalChars / 1000).toFixed(1)}k字`,
-                    checked: Boolean(config.includeFullText),
-                  },
-                  {
-                    key: 'includeNotes' as const,
-                    label: '笔记',
-                    sub: `${notesCount} 篇感悟`,
-                    checked: Boolean(config.includeNotes ?? config.includeAnnotations),
-                  },
-                  {
-                    key: 'includeExcerpts' as const,
-                    label: '书摘',
-                    sub: `${bookAnnotations.length} 条金句`,
-                    checked: Boolean(config.includeExcerpts ?? config.includeAnnotations),
-                  },
-                ].map((item) => (
-                  <label
-                    key={item.key}
-                    className="flex cursor-pointer flex-col justify-between rounded-xl p-2.5 text-xs transition-all"
-                    style={{
-                      backgroundColor: item.checked ? 'var(--accent-soft)' : 'var(--bg-page)',
-                      border: item.checked
-                        ? '1px solid var(--accent-primary)'
-                        : '1px solid var(--border-subtle)',
-                    }}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span
-                        className="font-semibold"
-                        style={{
-                          color: item.checked ? 'var(--accent-primary)' : 'var(--text-primary)',
-                        }}
-                      >
-                        {item.label}
-                      </span>
-                      <input
-                        type="checkbox"
-                        checked={item.checked}
-                        onChange={(e) => {
-                          const val = e.target.checked;
-                          setConfig((prev) => {
-                            const next = { ...prev, [item.key]: val };
-                            next.includeAnnotations = Boolean(
-                              next.includeNotes || next.includeExcerpts
-                            );
-                            return next;
-                          });
-                          setPdfPreviewPageIdx(0);
-                        }}
-                        className="h-3.5 w-3.5 accent-[#B4532A]"
-                      />
-                    </div>
-                    <span
-                      className="font-mono-tabular mt-1 text-[10px]"
-                      style={{ color: 'var(--text-muted)' }}
-                    >
-                      {item.sub}
-                    </span>
-                  </label>
-                ))}
-              </div>
-
-              {/* Auxiliary Dimensions: 章节大纲 & 阅读统计 */}
-              <div className="mt-2 grid grid-cols-2 gap-1.5">
-                {[
-                  {
-                    key: 'includeOutline' as const,
-                    label: '章节大纲',
-                    meta: `${bookChapters.length} 节`,
-                  },
-                  {
-                    key: 'includeStats' as const,
-                    label: '阅读统计',
-                    meta: `${metrics.progressPct}%`,
-                  },
-                ].map((item) => (
-                  <label
-                    key={item.key}
-                    className="flex cursor-pointer items-center justify-between rounded-xl px-3 py-2 text-xs"
-                    style={{
-                      backgroundColor: 'var(--bg-page)',
-                      border: '1px solid var(--border-subtle)',
-                    }}
-                  >
-                    <div>
-                      <span className="font-medium">{item.label}</span>
-                      <span
-                        className="font-mono-tabular ml-1 text-[10px]"
-                        style={{ color: 'var(--text-muted)' }}
-                      >
-                        {item.meta}
-                      </span>
-                    </div>
-                    <input
-                      type="checkbox"
-                      checked={config[item.key]}
-                      onChange={(e) => {
-                        setConfig((prev) => ({ ...prev, [item.key]: e.target.checked }));
-                        setPdfPreviewPageIdx(0);
-                      }}
-                      className="h-3.5 w-3.5 accent-[#B4532A]"
-                    />
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            {/* Optional Chapter Range Filter */}
-            <div>
-              <div className="flex items-center justify-between text-xs">
-                <span style={{ color: 'var(--text-secondary)' }}>
-                  章节范围：
-                  <strong className="ml-1" style={{ color: 'var(--text-primary)' }}>
-                    {config.selectedChapterIds.length === 0
-                      ? `全部章节 (${bookChapters.length})`
-                      : `已选 ${config.selectedChapterIds.length} / ${bookChapters.length} 章`}
-                  </strong>
-                </span>
+              <div className="mb-1.5 flex items-center justify-between text-[11px]">
+                <span style={{ color: 'var(--text-muted)' }}>导出模块</span>
                 <button
                   type="button"
-                  onClick={() => setShowChapterPicker((v) => !v)}
-                  className="text-xs font-medium underline underline-offset-4"
-                  style={{ color: 'var(--accent-primary)' }}
+                  onClick={() => {
+                    const nextVal = !isAllModulesChecked;
+                    setConfig((prev) => ({
+                      ...prev,
+                      includeFullText: nextVal,
+                      includeNotes: true,
+                      includeExcerpts: true,
+                      includeAnnotations: true,
+                      includeOutline: nextVal,
+                      includeStats: nextVal,
+                    }));
+                    setPdfPreviewPageIdx(0);
+                  }}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors"
+                  style={{
+                    color: 'var(--accent-primary)',
+                    backgroundColor: 'var(--bg-page)',
+                  }}
+                  title={isAllModulesChecked ? '仅导出笔记与书摘' : '全选所有导出模块'}
                 >
-                  {showChapterPicker ? '收起筛选' : '按章筛选'}
+                  <CheckCheck className="h-3 w-3" />
+                  <span>{isAllModulesChecked ? '仅书摘' : '全选'}</span>
                 </button>
               </div>
 
-              {showChapterPicker && (
-                <div
-                  className="mt-2 max-h-32 space-y-1 overflow-y-auto rounded-xl p-2"
-                  style={{
-                    backgroundColor: 'var(--bg-page)',
-                    border: '1px solid var(--border-subtle)',
-                  }}
-                >
-                  <div
-                    className="mb-1 flex justify-between border-b pb-1 text-[11px]"
-                    style={{ borderColor: 'var(--border-subtle)' }}
-                  >
+              <div className="grid grid-cols-5 gap-1.5">
+                {contentModules.map((item) => {
+                  const Icon = item.icon;
+                  return (
                     <button
+                      key={item.key}
                       type="button"
-                      onClick={() => setConfig((prev) => ({ ...prev, selectedChapterIds: [] }))}
-                      style={{ color: 'var(--accent-primary)' }}
+                      onClick={() => {
+                        setConfig((prev) => {
+                          const next = { ...prev, [item.key]: !item.active };
+                          next.includeAnnotations = Boolean(
+                            next.includeNotes || next.includeExcerpts
+                          );
+                          return next;
+                        });
+                        setPdfPreviewPageIdx(0);
+                      }}
+                      className="relative flex flex-col items-center justify-center gap-1 rounded-xl py-2.5 px-1 transition-all"
+                      style={{
+                        backgroundColor: item.active ? 'var(--accent-soft)' : 'var(--bg-page)',
+                        color: item.active ? 'var(--accent-primary)' : 'var(--text-muted)',
+                        border: item.active
+                          ? '1px solid var(--accent-primary)'
+                          : '1px solid var(--border-subtle)',
+                      }}
+                      title={item.tooltip}
+                      aria-pressed={item.active}
                     >
-                      全选所有章节
+                      <Icon className="h-4 w-4 shrink-0" />
+                      <span className="text-[11px] font-semibold leading-none">{item.label}</span>
+                      <span className="font-mono-tabular text-[9px] opacity-75 leading-none">
+                        {item.badge}
+                      </span>
                     </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setConfig((prev) => ({
-                          ...prev,
-                          selectedChapterIds: bookChapters[0] ? [bookChapters[0].id] : [],
-                        }))
-                      }
-                      style={{ color: 'var(--text-muted)' }}
-                    >
-                      仅首章
-                    </button>
-                  </div>
-                  {bookChapters.map((ch) => {
-                    const checked =
-                      config.selectedChapterIds.length === 0 ||
-                      config.selectedChapterIds.includes(ch.id);
-                    return (
-                      <label
-                        key={ch.id}
-                        className="flex cursor-pointer items-center justify-between rounded-lg px-2 py-1 text-xs hover:opacity-85"
-                      >
-                        <span className="truncate pr-2">
-                          <span className="font-mono-tabular mr-1 text-[10px] opacity-60">
-                            H{ch.level || 1}
-                          </span>
-                          {ch.title}
-                        </span>
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() => toggleChapterSelection(ch.id)}
-                          className="h-3.5 w-3.5 shrink-0 accent-[#B4532A]"
-                        />
-                      </label>
-                    );
-                  })}
-                </div>
-              )}
+                  );
+                })}
+              </div>
             </div>
 
-            {/* Theme Palette & Font Selector for Styled Formats */}
-            {(config.format === 'pdf' ||
-              config.format === 'html' ||
-              config.format === 'epub') && (
-              <div className="space-y-2.5">
-                <div>
-                  <div
-                    className="mb-1.5 flex items-center gap-1.5 text-xs font-medium"
-                    style={{ color: 'var(--text-secondary)' }}
-                  >
-                    <Palette className="h-3.5 w-3.5" />
-                    <span>纸张主题配色</span>
-                  </div>
-                  <div className="grid grid-cols-4 gap-1.5">
-                    {(
-                      [
-                        { id: 'parchment', label: '羊皮', hex: '#FBF7F0' },
-                        { id: 'caramel', label: '焦糖', hex: '#F7EEDF' },
-                        { id: 'espresso', label: '夜读', hex: '#211A15' },
-                        { id: 'eink', label: '墨水', hex: '#F7F7F7' },
-                      ] as { id: ExportThemeStyle; label: string; hex: string }[]
-                    ).map((t) => {
+            {/* 3. Unified Swatch & Typography Row (For Styled Formats: PDF / HTML) */}
+            {(config.format === 'pdf' || config.format === 'html') && (
+              <div
+                className="flex items-center justify-between gap-2 rounded-xl px-3 py-2.5"
+                style={{
+                  backgroundColor: 'var(--bg-page)',
+                  border: '1px solid var(--border-subtle)',
+                }}
+              >
+                {/* Paper Swatches */}
+                <div className="flex items-center gap-2" title="纸张配色">
+                  <Palette
+                    className="h-3.5 w-3.5 shrink-0"
+                    style={{ color: 'var(--text-muted)' }}
+                  />
+                  <div className="flex items-center gap-1.5" role="radiogroup" aria-label="纸张配色">
+                    {THEME_SWATCHES.map((t) => {
                       const active = config.themeStyle === t.id;
                       return (
                         <button
                           key={t.id}
                           type="button"
                           onClick={() => setConfig((prev) => ({ ...prev, themeStyle: t.id }))}
-                          className="flex items-center justify-center gap-1.5 rounded-xl py-1.5 text-xs font-medium"
+                          className="relative flex h-6 w-6 items-center justify-center rounded-full transition-transform active:scale-90"
                           style={{
-                            backgroundColor: active ? 'var(--accent-primary)' : 'var(--bg-page)',
-                            color: active ? '#FFFFFF' : 'var(--text-primary)',
-                            border: '1px solid var(--border-subtle)',
+                            backgroundColor: t.hex,
+                            border: active
+                              ? `2px solid ${t.ringHex}`
+                              : '1px solid rgba(128,128,128,0.35)',
+                            boxShadow: active ? `0 0 0 2px var(--bg-page)` : 'none',
                           }}
+                          title={`纸张配色：${t.label}`}
+                          aria-label={t.label}
                         >
-                          <span
-                            className="h-2.5 w-2.5 rounded-full border border-black/20"
-                            style={{ backgroundColor: t.hex }}
-                          />
-                          <span>{t.label}</span>
+                          {active && (
+                            <Check
+                              className="h-3 w-3"
+                              style={{
+                                color: t.id === 'espresso' ? '#F5E8C7' : '#2C1E16',
+                              }}
+                            />
+                          )}
                         </button>
                       );
                     })}
                   </div>
                 </div>
 
+                {/* Font Compact Segmented Icon Pills (PDF only) */}
                 {config.format === 'pdf' && (
-                  <div>
-                    <div
-                      className="mb-1.5 flex items-center gap-1.5 text-xs font-medium"
-                      style={{ color: 'var(--text-secondary)' }}
-                    >
-                      <Type className="h-3.5 w-3.5" />
-                      <span>PDF 典藏字体</span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-1.5">
-                      {(
-                        [
-                          { id: 'serif', label: '人文宋体' },
-                          { id: 'kaiti', label: '书房楷体' },
-                          { id: 'sans', label: '现代黑体' },
-                        ] as const
-                      ).map((f) => {
-                        const active = (config.fontStyle || 'serif') === f.id;
-                        return (
-                          <button
-                            key={f.id}
-                            type="button"
-                            onClick={() => setConfig((prev) => ({ ...prev, fontStyle: f.id }))}
-                            className="rounded-xl py-1.5 text-xs font-medium"
-                            style={{
-                              backgroundColor: active ? 'var(--accent-primary)' : 'var(--bg-page)',
-                              color: active ? '#FFFFFF' : 'var(--text-primary)',
-                              border: '1px solid var(--border-subtle)',
-                            }}
-                          >
-                            {f.label}
-                          </button>
-                        );
-                      })}
-                    </div>
+                  <div
+                    className="flex items-center gap-0.5 rounded-lg p-0.5"
+                    style={{
+                      backgroundColor: 'var(--bg-surface)',
+                      border: '1px solid var(--border-subtle)',
+                    }}
+                    role="radiogroup"
+                    aria-label="PDF 字体"
+                  >
+                    <Type
+                      className="mx-1 h-3 w-3 shrink-0"
+                      style={{ color: 'var(--text-muted)' }}
+                    />
+                    {FONT_PILLS.map((f) => {
+                      const active = (config.fontStyle || 'serif') === f.id;
+                      return (
+                        <button
+                          key={f.id}
+                          type="button"
+                          onClick={() => setConfig((prev) => ({ ...prev, fontStyle: f.id }))}
+                          className="flex h-6 w-6 items-center justify-center rounded-md text-[11px] font-semibold transition-colors"
+                          style={{
+                            backgroundColor: active ? 'var(--accent-primary)' : 'transparent',
+                            color: active ? '#FFFFFF' : 'var(--text-secondary)',
+                          }}
+                          title={f.tooltip}
+                          aria-label={f.tooltip}
+                        >
+                          {f.short}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>
             )}
+
+            {/* 4. Compact Chapter Scope Filter Accordion */}
+            <div
+              className="rounded-xl"
+              style={{
+                backgroundColor: 'var(--bg-page)',
+                border: '1px solid var(--border-subtle)',
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => setShowChapterPicker((v) => !v)}
+                className="flex w-full items-center justify-between px-3 py-2 text-xs"
+                title="按章节范围筛选导出内容"
+              >
+                <span className="flex items-center gap-1.5 font-medium">
+                  <ListFilter
+                    className="h-3.5 w-3.5"
+                    style={{ color: 'var(--accent-primary)' }}
+                  />
+                  <span>章节范围</span>
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span
+                    className="font-mono-tabular text-[11px]"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    {config.selectedChapterIds.length === 0
+                      ? `全部 (${bookChapters.length})`
+                      : `${config.selectedChapterIds.length} / ${bookChapters.length}`}
+                  </span>
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 transition-transform ${
+                      showChapterPicker ? 'rotate-180' : ''
+                    }`}
+                    style={{ color: 'var(--text-muted)' }}
+                  />
+                </span>
+              </button>
+
+              {showChapterPicker && (
+                <div
+                  className="border-t px-2.5 pt-1.5 pb-2"
+                  style={{ borderColor: 'var(--border-subtle)' }}
+                >
+                  <div className="mb-1.5 flex items-center justify-between text-[11px]">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfig((prev) => ({ ...prev, selectedChapterIds: [] }));
+                        setPdfPreviewPageIdx(0);
+                      }}
+                      className="flex items-center gap-1 rounded px-1.5 py-0.5 font-medium"
+                      style={{ color: 'var(--accent-primary)' }}
+                      title="选中全部章节"
+                    >
+                      <CheckCheck className="h-3 w-3" />
+                      <span>全选</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfig((prev) => ({
+                          ...prev,
+                          selectedChapterIds: bookChapters[0] ? [bookChapters[0].id] : [],
+                        }));
+                        setPdfPreviewPageIdx(0);
+                      }}
+                      className="rounded px-1.5 py-0.5"
+                      style={{ color: 'var(--text-muted)' }}
+                      title="仅选首章预览测试"
+                    >
+                      仅首章
+                    </button>
+                  </div>
+                  <div className="max-h-28 space-y-0.5 overflow-y-auto pr-0.5">
+                    {bookChapters.map((ch) => {
+                      const checked =
+                        config.selectedChapterIds.length === 0 ||
+                        config.selectedChapterIds.includes(ch.id);
+                      return (
+                        <button
+                          key={ch.id}
+                          type="button"
+                          onClick={() => toggleChapterSelection(ch.id)}
+                          className="flex w-full items-center justify-between rounded-lg px-2 py-1 text-left text-xs transition-colors hover:opacity-85"
+                          style={{
+                            backgroundColor: checked ? 'var(--accent-soft)' : 'transparent',
+                            color: checked ? 'var(--text-primary)' : 'var(--text-muted)',
+                          }}
+                        >
+                          <span className="truncate pr-2">
+                            <span className="font-mono-tabular mr-1 text-[10px] opacity-60">
+                              H{ch.level || 1}
+                            </span>
+                            {ch.title}
+                          </span>
+                          {checked && (
+                            <Check
+                              className="h-3 w-3 shrink-0"
+                              style={{ color: 'var(--accent-primary)' }}
+                            />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
-          {/* Primary Action Footer */}
-          <div className="mt-4 space-y-2 border-t pt-3" style={{ borderColor: 'var(--border-subtle)' }}>
-            {statusToast && (
+          {/* Bottom Action Dock: Icon Actions + Primary Download CTA */}
+          <div className="mt-3 space-y-2 border-t pt-3" style={{ borderColor: 'var(--border-subtle)' }}>
+            {statusToast ? (
               <div
-                className="flex items-center justify-center gap-1.5 rounded-lg py-1.5 text-xs font-medium"
+                className="flex items-center justify-center gap-1.5 rounded-lg py-1 text-xs font-medium"
                 style={{
                   backgroundColor: 'var(--accent-soft)',
                   color: 'var(--accent-primary)',
                 }}
               >
-                <Check className="h-3.5 w-3.5" />
-                <span>{statusToast}</span>
+                <Check className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">{statusToast}</span>
+              </div>
+            ) : (
+              <div
+                className="flex items-center justify-between text-[11px]"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                <span className="font-mono-tabular">
+                  {config.format === 'pdf' && jsPdfPreview
+                    ? `A4 · ${jsPdfPreview.totalPages} 页`
+                    : `${filteredChapters.length} 章 · ${bookAnnotations.length} 批注`}
+                </span>
+                <span className="font-mono-tabular">~{estimatedSizeKb} KB</span>
               </div>
             )}
-            <div
-              className="flex items-center justify-between text-[11px]"
-              style={{ color: 'var(--text-muted)' }}
-            >
-              <span>
-                {config.format === 'pdf' && jsPdfPreview
-                  ? `jsPDF A4 预览共 ${jsPdfPreview.totalPages} 页`
-                  : `包含 ${filteredChapters.length} 章 · ${bookAnnotations.length} 批注`}
-              </span>
-              <span className="font-mono-tabular">约 {estimatedSizeKb} KB</span>
-            </div>
-            <div className="flex gap-2">
-              {config.format === 'pdf' ? (
+
+            <div className="flex items-center gap-1.5">
+              {/* Icon-Only Secondary Action: Print */}
+              {(config.format === 'pdf' || config.format === 'html') && (
                 <button
                   type="button"
                   onClick={handleNativePrintPdf}
-                  className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium"
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl transition-colors hover:opacity-85"
                   style={{
                     backgroundColor: 'var(--bg-page)',
                     color: 'var(--text-primary)',
                     border: '1px solid var(--border-strong)',
                   }}
-                  title="调用浏览器打印视图"
+                  title="唤起系统原生矢量打印"
+                  aria-label="打印"
                 >
-                  <Printer className="h-3.5 w-3.5" />
-                  <span>打印</span>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={handleCopyContent}
-                  className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-medium"
-                  style={{
-                    backgroundColor: 'var(--bg-page)',
-                    color: 'var(--text-primary)',
-                    border: '1px solid var(--border-strong)',
-                  }}
-                  title="复制内容到剪贴板"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                  <span>复制</span>
+                  <Printer className="h-4 w-4" />
                 </button>
               )}
+
+              {/* Icon-Only Secondary Action: Copy to Clipboard */}
               <button
                 type="button"
-                onClick={handlePrimaryExport}
-                className="flex min-h-[42px] flex-1 items-center justify-center gap-2 rounded-xl px-4 py-2 text-xs font-semibold text-white transition-transform active:scale-[0.99]"
-                style={{ backgroundColor: 'var(--accent-primary)' }}
+                onClick={handleCopyContent}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl transition-colors hover:opacity-85"
+                style={{
+                  backgroundColor: 'var(--bg-page)',
+                  color: copiedFlag ? 'var(--accent-primary)' : 'var(--text-primary)',
+                  border: '1px solid var(--border-strong)',
+                }}
+                title="复制导出内容到剪贴板"
+                aria-label="复制内容"
               >
-                <Download className="h-4 w-4" />
-                <span>
-                  {config.format === 'pdf'
-                    ? 'jsPDF 下载精美 PDF (.pdf)'
-                    : `立即导出 ${FORMAT_OPTIONS.find((f) => f.id === config.format)?.ext}`}
+                {copiedFlag ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+              </button>
+
+              {/* Primary Export Button */}
+              <button
+                type="button"
+                disabled={isExporting}
+                onClick={handlePrimaryExport}
+                className="flex h-10 flex-1 items-center justify-center gap-2 rounded-xl px-4 text-xs font-semibold text-white transition-transform active:scale-[0.99] disabled:opacity-60 whitespace-nowrap"
+                style={{ backgroundColor: 'var(--accent-primary)' }}
+                title={`下载 ${currentFormatMeta.ext} 文件`}
+              >
+                {isExporting ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="h-4 w-4" />
+                )}
+                <span>导出 {currentFormatMeta.shortLabel}</span>
+                <span className="font-mono-tabular text-[11px] opacity-80">
+                  ({currentFormatMeta.ext})
                 </span>
               </button>
             </div>
           </div>
         </div>
 
-        {/* Right: Live Document / jsPDF A4 Multi-Page Preview Pane */}
+        {/* Right Live Preview Canvas */}
         <div
           className="flex flex-1 flex-col overflow-hidden"
           style={{ backgroundColor: 'var(--bg-canvas)' }}
         >
+          {/* Minimal Icon-Driven Preview Toolbar */}
           <div
-            className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5 sm:px-5 sm:py-3"
+            className="flex items-center justify-between gap-2 border-b px-4 py-2.5"
             style={{
               backgroundColor: 'var(--bg-page)',
               borderColor: 'var(--border-subtle)',
             }}
           >
-            <div className="flex min-w-0 flex-1 items-center gap-2 text-xs">
-              <Sparkles className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--accent-primary)' }} />
-              <span className="shrink-0 font-semibold">
-                {config.format === 'pdf'
-                  ? 'jsPDF A4 书页排版实时预览'
-                  : '实时排版与结构预览'}
+            <div className="flex min-w-0 items-center gap-2 text-xs">
+              <span className="font-medium truncate">《{activeBook.title}》</span>
+              <span aria-hidden="true" style={{ color: 'var(--text-muted)' }}>
+                ·
               </span>
-              <span className="shrink-0" style={{ color: 'var(--text-muted)' }}>·</span>
-              <span className="font-mono-tabular min-w-0 truncate" style={{ color: 'var(--text-muted)' }}>
-                《{activeBook.title}》
+              <span
+                className="font-mono-tabular shrink-0 text-[11px]"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                {currentFormatMeta.shortLabel} 实时预览
               </span>
             </div>
 
-            <div className="flex shrink-0 items-center gap-2">
+            {/* Pure Icon Toolbar on Right */}
+            <div className="flex shrink-0 items-center gap-1">
               {config.format === 'pdf' && jsPdfPreview && jsPdfPreview.totalPages > 0 && (
-                <div className="flex items-center gap-1">
+                <>
                   <button
                     type="button"
                     onClick={() => setPdfZoomFit((v) => !v)}
-                    className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px]"
+                    className="flex h-7 w-7 items-center justify-center rounded-lg transition-colors"
                     style={{
                       backgroundColor: 'var(--bg-surface)',
                       color: 'var(--text-secondary)',
                       border: '1px solid var(--border-subtle)',
                     }}
-                    title={pdfZoomFit ? '切换至100%幅面预览' : '切换至自适应窗口'}
+                    title={pdfZoomFit ? '放大预览幅面' : '自适应窗口大小'}
+                    aria-label={pdfZoomFit ? '放大预览' : '适屏预览'}
                   >
                     {pdfZoomFit ? (
-                      <>
-                        <ZoomIn className="h-3 w-3" />
-                        <span>放大</span>
-                      </>
+                      <ZoomIn className="h-3.5 w-3.5" />
                     ) : (
-                      <>
-                        <ZoomOut className="h-3 w-3" />
-                        <span>适屏</span>
-                      </>
+                      <ZoomOut className="h-3.5 w-3.5" />
                     )}
                   </button>
 
-                  <button
-                    type="button"
-                    disabled={pdfPreviewPageIdx <= 0}
-                    onClick={() => setPdfPreviewPageIdx((p) => Math.max(0, p - 1))}
-                    className="flex h-7 w-7 items-center justify-center rounded-lg disabled:opacity-35"
+                  <div
+                    className="mx-0.5 flex items-center rounded-lg p-0.5"
                     style={{
                       backgroundColor: 'var(--bg-surface)',
                       border: '1px solid var(--border-subtle)',
                     }}
-                    title="上一页"
                   >
-                    <ChevronLeft className="h-3.5 w-3.5" />
-                  </button>
-                  <span className="font-mono-tabular px-1.5 text-xs">
-                    {pdfPreviewPageIdx + 1} / {jsPdfPreview.totalPages}
-                  </span>
-                  <button
-                    type="button"
-                    disabled={pdfPreviewPageIdx + 1 >= jsPdfPreview.totalPages}
-                    onClick={() =>
-                      setPdfPreviewPageIdx((p) =>
-                        Math.min(jsPdfPreview.totalPages - 1, p + 1)
-                      )
-                    }
-                    className="flex h-7 w-7 items-center justify-center rounded-lg disabled:opacity-35"
-                    style={{
-                      backgroundColor: 'var(--bg-surface)',
-                      border: '1px solid var(--border-subtle)',
-                    }}
-                    title="下一页"
-                  >
-                    <ChevronRight className="h-3.5 w-3.5" />
-                  </button>
-                </div>
+                    <button
+                      type="button"
+                      disabled={pdfPreviewPageIdx <= 0}
+                      onClick={() => setPdfPreviewPageIdx((p) => Math.max(0, p - 1))}
+                      className="flex h-6 w-6 items-center justify-center rounded-md disabled:opacity-30"
+                      title="上一页 (←)"
+                      aria-label="上一页"
+                    >
+                      <ChevronLeft className="h-3.5 w-3.5" />
+                    </button>
+                    <span className="font-mono-tabular px-2 text-[11px] font-medium">
+                      {pdfPreviewPageIdx + 1} / {jsPdfPreview.totalPages}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={pdfPreviewPageIdx + 1 >= jsPdfPreview.totalPages}
+                      onClick={() =>
+                        setPdfPreviewPageIdx((p) =>
+                          Math.min(jsPdfPreview.totalPages - 1, p + 1)
+                        )
+                      }
+                      className="flex h-6 w-6 items-center justify-center rounded-md disabled:opacity-30"
+                      title="下一页 (→)"
+                      aria-label="下一页"
+                    >
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </>
               )}
 
               <button
                 type="button"
                 onClick={onClose}
-                className="hidden h-7 w-7 items-center justify-center rounded-lg lg:flex"
-                style={{ color: 'var(--text-muted)' }}
-                title="关闭"
+                className="ml-1 hidden h-7 w-7 items-center justify-center rounded-lg transition-colors hover:opacity-80 lg:flex"
+                style={{
+                  backgroundColor: 'var(--bg-surface)',
+                  color: 'var(--text-muted)',
+                  border: '1px solid var(--border-subtle)',
+                }}
+                title="关闭工作台 (Esc)"
+                aria-label="关闭"
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
           </div>
 
+          {/* Preview Viewport */}
           <div className="flex-1 overflow-y-auto p-4 sm:p-6">
             {config.format === 'pdf' && jsPdfPreview ? (
               <div className="flex flex-col items-center gap-4">
-                {/* Active A4 Page Sheet Preview */}
                 <div
-                  className={`overflow-hidden rounded-xl border transition-all ${
-                    pdfZoomFit ? 'max-w-[440px]' : 'max-w-[660px]'
+                  onDoubleClick={() => setPdfZoomFit((v) => !v)}
+                  className={`overflow-hidden rounded-xl border transition-all cursor-zoom-in ${
+                    pdfZoomFit ? 'max-w-[430px]' : 'max-w-[660px]'
                   } w-full shadow-xl`}
                   style={{
                     borderColor: 'var(--border-strong)',
                     backgroundColor: 'var(--bg-page)',
                   }}
+                  title="双击切换缩放比例"
                 >
                   {jsPdfPreview.pageDataUrls[pdfPreviewPageIdx] && (
                     <img
@@ -982,9 +1106,9 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
                   )}
                 </div>
 
-                {/* Multi-page Thumbnail Strip */}
+                {/* Compact Page Thumbnail Filmstrip */}
                 {jsPdfPreview.totalPages > 1 && (
-                  <div className="flex max-w-full items-center gap-2 overflow-x-auto pb-2">
+                  <div className="flex max-w-full items-center gap-2 overflow-x-auto pb-1">
                     {jsPdfPreview.pageDataUrls.map((url, idx) => {
                       const isCurrent = idx === pdfPreviewPageIdx;
                       return (
@@ -994,7 +1118,7 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
                           onClick={() => setPdfPreviewPageIdx(idx)}
                           className="group relative shrink-0 overflow-hidden rounded-lg border transition-transform"
                           style={{
-                            width: '54px',
+                            width: '48px',
                             borderColor: isCurrent
                               ? 'var(--accent-primary)'
                               : 'var(--border-subtle)',
@@ -1002,6 +1126,7 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
                               ? '0 0 0 2px var(--accent-primary)'
                               : 'none',
                           }}
+                          title={`跳转至第 ${idx + 1} 页`}
                         >
                           <img
                             src={url}
@@ -1049,7 +1174,8 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
                 }}
               >
                 {previewText.slice(0, 4200)}
-                {previewText.length > 4200 && '\n\n…（预览已折叠后续正文，导出文件包含完整内容）'}
+                {previewText.length > 4200 &&
+                  '\n\n…（预览已折叠后续正文，导出文件包含完整内容）'}
               </div>
             )}
           </div>
@@ -1058,4 +1184,3 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
     </div>
   );
 };
-

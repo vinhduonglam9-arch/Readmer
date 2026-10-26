@@ -514,13 +514,16 @@ async function synthesizeWithEdgeTts(options: {
   });
 }
 
+const MAX_TTS_CACHE_ENTRIES = 48;
+const edgeTtsServerCache = new Map<string, Buffer>();
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: '1mb' }));
 
-  // Microsoft Edge Neural TTS API Endpoint
+  // Microsoft Edge Neural TTS API Endpoint with Server-Side LRU Audio Cache
   app.post('/api/tts/edge', async (req, res) => {
     try {
       const { text, voice = 'zh-CN-XiaoxiaoNeural', rate = 1.0, pitch = 1.0 } = req.body || {};
@@ -529,12 +532,32 @@ async function startServer() {
         return;
       }
 
-      const mp3Buffer = await synthesizeWithEdgeTts({
-        text: text.trim(),
-        voice: String(voice),
-        rate: Number(rate) || 1.0,
-        pitch: Number(pitch) || 1.0,
-      });
+      const cleanText = text.trim();
+      const cleanVoice = String(voice);
+      const cleanRate = Number(rate) || 1.0;
+      const cleanPitch = Number(pitch) || 1.0;
+      const cacheKey = `${cleanVoice}|${cleanRate.toFixed(2)}|${cleanPitch.toFixed(2)}|${cleanText}`;
+
+      let mp3Buffer = edgeTtsServerCache.get(cacheKey);
+      if (mp3Buffer) {
+        // Refresh LRU order
+        edgeTtsServerCache.delete(cacheKey);
+        edgeTtsServerCache.set(cacheKey, mp3Buffer);
+      } else {
+        mp3Buffer = await synthesizeWithEdgeTts({
+          text: cleanText,
+          voice: cleanVoice,
+          rate: cleanRate,
+          pitch: cleanPitch,
+        });
+        if (edgeTtsServerCache.size >= MAX_TTS_CACHE_ENTRIES) {
+          const oldestKey = edgeTtsServerCache.keys().next().value;
+          if (oldestKey !== undefined) {
+            edgeTtsServerCache.delete(oldestKey);
+          }
+        }
+        edgeTtsServerCache.set(cacheKey, mp3Buffer);
+      }
 
       res.setHeader('Content-Type', 'audio/mpeg');
       res.setHeader('Content-Length', String(mp3Buffer.length));

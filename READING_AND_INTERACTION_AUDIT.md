@@ -44,7 +44,30 @@
 - **根因分析**：
   - 当用户已解锁私密空间（`vaultKeyRef.current` 存在）并导入 `.json` 全量备份文件恢复书库时，虽然 IndexedDB 与 `books` 状态已更新，但未立即触发 `hydratePrivateVaultIntoMemory`，导致恢复的加密书籍需重新锁定再解锁才能显示解密标题与正文。
 - **修复方案**：
-  - 在 `handleImportBackupFile` 与 `handleImportFiles` 的备份恢复分支中，若检测到当前会话 `vaultKeyRef.current` 处于激活状态，立即自动执行 `hydratePrivateVaultIntoMemory` 并展示恢复反馈提示。
+  - 在 `handleImportBackupFile` 与 `handleImportFiles` 的备份恢复分支中，若检测到当前会话 `vaultKeyRef.current` 处于激活状态，立即自动执行 `hydratePrivateVaultIntoMemory` 并展示恢复反馈提示，同时补齐 `useCallback` 依赖数组。
+
+### 4. [已修复] 私密空间秒锁/切屏时的防抖进度冲刷与删除防复活竞态
+- **问题定位**：`src/App.tsx` (`scheduleBookPersistence`、`wipeSessionMemoryAndLock`、`handleDeleteBook`)
+- **根因分析**：
+  - 阅读进度采用 1200ms 防抖写入 IndexedDB（`scheduleBookPersistence`）。若用户在私密空间翻页后 1.2 秒内立即锁定私密空间或触发切屏秒锁，`wipeSessionMemoryAndLock` 会先将 `vaultKeyRef.current` 置为 `null`，导致尚未触发的防抖定时器因丢失加密密钥而静默丢弃最新一页的阅读进度。
+  - 若用户在翻页或滚动后 1.2 秒内返回书架并删除该书籍，尚未到期的防抖定时器会再次调用 `saveBook`，导致已从 IndexedDB 删除的书籍被重新写入。
+- **修复方案**：
+  - 新增 `flushPendingBookPersistences` 并在 `scheduleBookPersistence` 调度时捕获会话密钥，在 `wipeSessionMemoryAndLock` 清空内存密钥前立即冲刷所有挂起的加密持久化队列。
+  - 在 `handleDeleteBook` 中立即清理对应 `bookId` 的 `persistBookTimersRef` 与 `pendingBooksToPersistRef`，彻底杜绝删除后的防抖重写竞态，并智能回退至当前空间（公开或私密）的下一册可用书籍。
+
+### 5. [已修复] 连续滚动模式下「返回跳前位置」的 DOM 节点级精准对齐
+- **问题定位**：`src/components/ReaderView.tsx` (`jumpBackState` 按钮回调)
+- **根因分析**：
+  - 在长卷滚动模式下点击目录/搜索跳转后的「返回跳前位置」浮窗时，原先仅使用 `(originOffset / book.totalChars) * maxScroll` 比例估算，在富含 Mermaid 图表或长代码块的文档中会出现回归位置偏移。
+- **修复方案**：
+  - 统一与 `jumpToCharOffset` 相同的精准定位策略：优先通过 `[data-start-offset]` 查找跳前虚拟页首段 DOM 节点并执行平滑 `scrollIntoView`，仅当节点未挂载时回退至字符比例滚动。
+
+### 6. [已修复] 公开书架与私密空间切换时的批量选择态隔离
+- **问题定位**：`src/components/BookshelfView.tsx` (`isPrivateSpaceMode` 切换与单本删除)
+- **根因分析**：
+  - 在书架开启「批量管理」并勾选书籍后，若切换公开书架与私密空间（或单独删除已勾选的某本书），`selectedBookIds` 中可能残留不属于当前空间的书籍 ID。
+- **修复方案**：
+  - 监听 `isPrivateSpaceMode` 切换自动重置 `selectedBookIds`、`batchMode` 与瞬态确认菜单；单本删除确认时同步从 `selectedBookIds` 过滤该书籍 ID。
 
 ---
 
@@ -52,8 +75,9 @@
 
 1. **零知识加密安全性**：
    - 私密书籍的 `title`、`author`、`content`、`chapters` 及私密批注的 `selectedText`、`note` 在落盘 IndexedDB 前均经 AES-256-GCM 独立随机 IV 加密，密文前缀 `ENC_V1:`。
-   - 仅当用户输入正确口令派生密钥后，在 React 内存映射表 (`decryptedBooksMap` / `decryptedAnnsMap`) 中解密展示；上锁时立即清空内存引用。
+   - 仅当用户输入正确口令派生密钥后，在 React 内存映射表 (`decryptedBooksMap` / `decryptedAnnsMap`) 中解密展示；上锁时先冲刷挂起进度再立即清空内存引用。
 2. **渲染与分页性能**：
    - `parsedBlocks` 仅依赖 `book.content` 缓存；调节字号、行高、段距、版心宽度或窗口尺寸时跳过 Markdown AST 解析，仅执行轻量几何分页计算。
 3. **构建与静态类型检查**：
    - 通过 `tsc --noEmit` 严格类型检查与 `vite build` 生产构建验证，零编译错误与死代码警告。
+

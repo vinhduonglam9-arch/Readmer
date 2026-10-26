@@ -31,10 +31,8 @@ import { Annotation, Book, CoverPreset, ReadingStatsDaily } from '../types/reade
 import {
   buildBatchBooksMarkdown,
   buildCsvExport,
-  buildEpubBlob,
   buildStructuredJsonExport,
   DEFAULT_EXPORT_CONFIG,
-  triggerBlobDownload,
 } from '../core/exportEngine';
 import { triggerFileDownload } from '../core/parserEngine';
 import { BookCoverArt } from './BookCoverArt';
@@ -151,6 +149,7 @@ export const BookshelfView: React.FC<BookshelfViewProps> = ({
       }
       setConfirmDeleteBookId(null);
       setActiveTouchMenuBookId(null);
+      setSelectedBookIds((prev) => prev.filter((id) => id !== bookId));
       onDeleteBook(bookId);
     } else {
       setConfirmDeleteBookId(bookId);
@@ -171,6 +170,13 @@ export const BookshelfView: React.FC<BookshelfViewProps> = ({
     }
     setConfirmDeleteBookId(null);
   };
+
+  useEffect(() => {
+    setSelectedBookIds([]);
+    setBatchMode(false);
+    setConfirmDeleteBookId(null);
+    setActiveTouchMenuBookId(null);
+  }, [isPrivateSpaceMode]);
 
   useEffect(() => {
     try {
@@ -358,7 +364,7 @@ export const BookshelfView: React.FC<BookshelfViewProps> = ({
     setTimeout(() => setBatchToast(null), 3000);
   };
 
-  const handleBatchExport = (type: 'md' | 'csv' | 'json' | 'epub') => {
+  const handleBatchExport = (type: 'md' | 'csv' | 'json') => {
     const targets = selectedBatchBooks.length > 0 ? selectedBatchBooks : filteredBooks;
     if (targets.length === 0) return;
     const targetIds = new Set(targets.map((b) => b.id));
@@ -386,16 +392,6 @@ export const BookshelfView: React.FC<BookshelfViewProps> = ({
         'application/json'
       );
       setBatchToast(`已导出 ${targets.length} 册 JSON 数据`);
-    } else if (type === 'epub') {
-      targets.forEach((b, idx) => {
-        setTimeout(() => {
-          const bAnns = annotations.filter((a) => a.bookId === b.id);
-          const blob = buildEpubBlob(b, bAnns, dailyStats, DEFAULT_EXPORT_CONFIG);
-          const safe = b.title.replace(/[\\/:*?"<>|]/g, '');
-          triggerBlobDownload(`${safe}.epub`, blob);
-        }, idx * 250);
-      });
-      setBatchToast(`已打包导出 ${targets.length} 册 EPUB 电子书`);
     }
     setTimeout(() => setBatchToast(null), 3200);
   };
@@ -1930,20 +1926,6 @@ export const BookshelfView: React.FC<BookshelfViewProps> = ({
                 aria-label="导出 Markdown 合集"
               >
                 <Hash className="h-4 w-4" style={{ color: 'var(--accent-primary)' }} />
-              </button>
-              <button
-                type="button"
-                onClick={() => handleBatchExport('epub')}
-                className="flex h-8 w-8 items-center justify-center rounded-xl transition-colors"
-                style={{
-                  backgroundColor: 'var(--bg-page)',
-                  border: '1px solid var(--border-subtle)',
-                  color: 'var(--text-primary)',
-                }}
-                title="批量打包 EPUB 电子书 (.epub)"
-                aria-label="导出 EPUB 电子书"
-              >
-                <BookOpen className="h-4 w-4" style={{ color: 'var(--accent-primary)' }} />
               </button>
               <button
                 type="button"

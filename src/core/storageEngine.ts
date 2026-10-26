@@ -43,8 +43,14 @@ export const DEFAULT_READER_SETTINGS: ReaderSettings = {
   ttsPitch: 1.0,
 };
 
+let cachedDbPromise: Promise<IDBDatabase> | null = null;
+
 function openDatabase(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (cachedDbPromise) {
+    return cachedDbPromise;
+  }
+
+  cachedDbPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
 
     request.onupgradeneeded = () => {
@@ -64,9 +70,24 @@ function openDatabase(): Promise<IDBDatabase> {
       }
     };
 
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => {
+        db.close();
+        cachedDbPromise = null;
+      };
+      db.onclose = () => {
+        cachedDbPromise = null;
+      };
+      resolve(db);
+    };
+    request.onerror = () => {
+      cachedDbPromise = null;
+      reject(request.error);
+    };
   });
+
+  return cachedDbPromise;
 }
 
 function getAllFromStore<T>(storeName: string): Promise<T[]> {
@@ -115,10 +136,12 @@ export async function initializeLibraryStorage(): Promise<{
   dailyStats: ReadingStatsDaily[];
   settings: ReaderSettings;
 }> {
-  let books = await getAllFromStore<Book>(STORE_BOOKS);
-  let annotations = await getAllFromStore<Annotation>(STORE_ANNOTATIONS);
-  const customFonts = await getAllFromStore<CustomFont>(STORE_FONTS);
-  let dailyStats = await getAllFromStore<ReadingStatsDaily>(STORE_STATS);
+  let [books, annotations, customFonts, dailyStats] = await Promise.all([
+    getAllFromStore<Book>(STORE_BOOKS),
+    getAllFromStore<Annotation>(STORE_ANNOTATIONS),
+    getAllFromStore<CustomFont>(STORE_FONTS),
+    getAllFromStore<ReadingStatsDaily>(STORE_STATS),
+  ]);
 
   const hasMigratedPatrioticSeed = localStorage.getItem(SEED_VERSION_KEY) === 'true';
 
@@ -136,12 +159,6 @@ export async function initializeLibraryStorage(): Promise<{
       'patriotic-young-china-md-v3',
       'patriotic-yellow-river-md-v3',
     ];
-    for (const oldId of legacyIds) {
-      await deleteFromStore(STORE_BOOKS, oldId);
-    }
-    for (const sampleBook of INITIAL_SAMPLE_BOOKS) {
-      await putIntoStore(STORE_BOOKS, sampleBook);
-    }
 
     const initialAnnotations: Annotation[] = [
       {
@@ -167,26 +184,43 @@ export async function initializeLibraryStorage(): Promise<{
         createdAt: Date.now() - 86400000,
       },
     ];
-    for (const ann of initialAnnotations) {
-      await putIntoStore(STORE_ANNOTATIONS, ann);
-    }
 
-    if (dailyStats.length === 0) {
-      const seededStats = generateSeededDailyStats();
-      for (const stat of seededStats) {
-        await putIntoStore(STORE_STATS, stat);
+    const seededStats = dailyStats.length === 0 ? generateSeededDailyStats() : [];
+    const db = await openDatabase();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction([STORE_BOOKS, STORE_ANNOTATIONS, STORE_STATS], 'readwrite');
+      const bookStore = tx.objectStore(STORE_BOOKS);
+      const annStore = tx.objectStore(STORE_ANNOTATIONS);
+      const statStore = tx.objectStore(STORE_STATS);
+
+      for (const oldId of legacyIds) {
+        bookStore.delete(oldId);
       }
+      for (const sampleBook of INITIAL_SAMPLE_BOOKS) {
+        bookStore.put(sampleBook);
+      }
+      for (const ann of initialAnnotations) {
+        annStore.put(ann);
+      }
+      for (const stat of seededStats) {
+        statStore.put(stat);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+
+    if (seededStats.length > 0) {
       dailyStats = seededStats;
     }
 
     localStorage.setItem(SEED_VERSION_KEY, 'true');
-    books = await getAllFromStore<Book>(STORE_BOOKS);
-    annotations = await getAllFromStore<Annotation>(STORE_ANNOTATIONS);
+    [books, annotations] = await Promise.all([
+      getAllFromStore<Book>(STORE_BOOKS),
+      getAllFromStore<Annotation>(STORE_ANNOTATIONS),
+    ]);
   }
 
-  for (const font of customFonts) {
-    await registerCustomFontFace(font);
-  }
+  await Promise.all(customFonts.map((font) => registerCustomFontFace(font)));
 
   const settings = loadReaderSettings();
 
@@ -226,13 +260,38 @@ export async function saveBook(book: Book): Promise<void> {
 }
 
 export async function removeBook(bookId: string): Promise<void> {
-  await deleteFromStore(STORE_BOOKS, bookId);
-  const allAnns = await getAllFromStore<Annotation>(STORE_ANNOTATIONS);
-  for (const ann of allAnns) {
-    if (ann.bookId === bookId) {
-      await deleteFromStore(STORE_ANNOTATIONS, ann.id);
+  const db = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction([STORE_BOOKS, STORE_ANNOTATIONS], 'readwrite');
+    const bookStore = tx.objectStore(STORE_BOOKS);
+    const annStore = tx.objectStore(STORE_ANNOTATIONS);
+
+    bookStore.delete(bookId);
+
+    if (annStore.indexNames.contains('bookId')) {
+      const idx = annStore.index('bookId');
+      const keysReq = idx.getAllKeys(IDBKeyRange.only(bookId));
+      keysReq.onsuccess = () => {
+        const keys = keysReq.result || [];
+        for (const k of keys) {
+          annStore.delete(k);
+        }
+      };
+    } else {
+      const allReq = annStore.getAll();
+      allReq.onsuccess = () => {
+        const list = (allReq.result as Annotation[]) || [];
+        for (const ann of list) {
+          if (ann.bookId === bookId) {
+            annStore.delete(ann.id);
+          }
+        }
+      };
     }
-  }
+
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
 }
 
 export async function saveAnnotation(ann: Annotation): Promise<void> {
@@ -331,17 +390,29 @@ export async function recordReadingProgressDelta(
 }
 
 export async function restoreFullLibraryBackup(backup: FullLibraryBackup): Promise<void> {
-  for (const book of backup.books) {
-    await putIntoStore(STORE_BOOKS, book);
-  }
-  for (const ann of backup.annotations) {
-    await putIntoStore(STORE_ANNOTATIONS, ann);
-  }
-  if (Array.isArray(backup.dailyStats)) {
-    for (const stat of backup.dailyStats) {
-      await putIntoStore(STORE_STATS, stat);
+  const db = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction([STORE_BOOKS, STORE_ANNOTATIONS, STORE_STATS], 'readwrite');
+    const bookStore = tx.objectStore(STORE_BOOKS);
+    const annStore = tx.objectStore(STORE_ANNOTATIONS);
+    const statStore = tx.objectStore(STORE_STATS);
+
+    for (const book of backup.books) {
+      bookStore.put(book);
     }
-  }
+    for (const ann of backup.annotations) {
+      annStore.put(ann);
+    }
+    if (Array.isArray(backup.dailyStats)) {
+      for (const stat of backup.dailyStats) {
+        statStore.put(stat);
+      }
+    }
+
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
   if (backup.settings) {
     saveReaderSettings(backup.settings);
   }

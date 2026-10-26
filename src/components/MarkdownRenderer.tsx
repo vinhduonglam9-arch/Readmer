@@ -465,7 +465,7 @@ export const MermaidBlock: React.FC<{
   theme: ReaderTheme;
   forceTopDown?: boolean;
   parentContainerWidth?: number;
-}> = ({ code, theme, forceTopDown = false, parentContainerWidth }) => {
+}> = React.memo(({ code, theme, forceTopDown = false, parentContainerWidth }) => {
   const [svgHtml, setSvgHtml] = useState<string>('');
   const [naturalSize, setNaturalSize] = useState<{ width: number; height: number }>({
     width: 560,
@@ -768,14 +768,14 @@ export const MermaidBlock: React.FC<{
       )}
     </div>
   );
-};
+});
 
 export const CodeBlockView: React.FC<{
   code: string;
   lang?: string;
   isContinuation?: boolean;
   isLastBlock?: boolean;
-}> = ({ code, lang, isContinuation, isLastBlock = false }) => {
+}> = React.memo(({ code, lang, isContinuation, isLastBlock = false }) => {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = () => {
@@ -825,7 +825,7 @@ export const CodeBlockView: React.FC<{
       </pre>
     </div>
   );
-};
+});
 
 function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -863,9 +863,15 @@ function decorateHtmlWithInlineHighlights(
   annotations: Annotation[] | undefined,
   searchQuery?: string
 ): string {
+  const hasAnnotations = Boolean(annotations && annotations.length > 0);
+  const trimmedQuery = searchQuery ? searchQuery.trim() : '';
+  if (!hasAnnotations && trimmedQuery.length === 0) {
+    return baseHtml;
+  }
+
   let result = baseHtml;
 
-  if (annotations && annotations.length > 0) {
+  if (hasAnnotations && annotations) {
     // Sort longer selections first so longer highlights wrap cleanly
     const relevantAnns = annotations
       .filter((a) => a.type === 'note' && a.selectedText && a.selectedText.trim().length >= 2)
@@ -927,7 +933,7 @@ export const MarkdownBlockRenderer: React.FC<{
   isTtsActive?: boolean;
   isTtsModeOpen?: boolean;
   onClickBlockForTts?: (startOffset: number) => void;
-}> = ({
+}> = React.memo(({
   block,
   settings,
   highlightBg = 'transparent',
@@ -1303,4 +1309,5 @@ export const MarkdownBlockRenderer: React.FC<{
   };
 
   return renderInnerBlock();
-};
+});
+

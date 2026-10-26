@@ -208,7 +208,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 }) => {
   const [chromeVisible, setChromeVisible] = useState(true);
   const [activeDrawer, setActiveDrawer] = useState<'none' | 'toc' | 'settings'>('none');
-  const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportInitialFormat, setExportInitialFormat] = useState<ExportFormat>('pdf');
   const [quickPdfConfig, setQuickPdfConfig] = useState<ExportConfig>({
@@ -222,7 +221,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     themeStyle: 'parchment',
     fontStyle: 'serif',
   });
-  const [quickPdfFeedback, setQuickPdfFeedback] = useState<string | null>(null);
   const [quoteCardTarget, setQuoteCardTarget] = useState<{
     chapterTitle: string;
     selectedText: string;
@@ -306,10 +304,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     };
   }, []);
 
-  // Automatically parse hierarchical Markdown headings (#, ##, ###, ####) & chapters for the Outline
+  // Reuse pre-parsed chapters from book import when available, falling back to extraction
   const outlineHeadings: Chapter[] = useMemo(() => {
-    const parsed = extractChapters(book.content, book.format);
-    return parsed.length > 0 ? parsed : book.chapters;
+    if (book.chapters && book.chapters.length > 0) {
+      return book.chapters;
+    }
+    return extractChapters(book.content, book.format);
   }, [book.content, book.format, book.chapters]);
 
   // Cache AST blocks separately from typography/viewport settings so font/margin/resize changes
@@ -528,8 +528,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const ttsRate = settings.ttsRate ?? 1.0;
   const ttsPitch = settings.ttsPitch ?? 1.0;
 
-  // Flatten all narratable blocks across virtualPages with their pageIndex and pre-built speech text
+  // Lazily flatten narratable blocks only when the TTS capsule/player is active or open
   const narratableBlocks = useMemo(() => {
+    if (!ttsBarOpen && ttsStatus === 'idle') return [];
     const list: {
       block: VirtualPage['paragraphs'][number];
       pageIndex: number;
@@ -548,7 +549,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       });
     });
     return list;
-  }, [virtualPages]);
+  }, [virtualPages, ttsBarOpen, ttsStatus]);
 
   const activeTtsOffset = useMemo(() => {
     if (activeTtsBlockIdx === null || !narratableBlocks[activeTtsBlockIdx]) return null;
@@ -1045,7 +1046,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       // Ctrl/Cmd + F opens in-book full-text search
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
         e.preventDefault();
-        setExportMenuOpen(false);
         setActiveDrawer('toc');
         setTocTab('search');
         setTimeout(() => searchInputRef.current?.focus(), 60);
@@ -1242,10 +1242,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       setActiveDrawer('none');
       return;
     }
-    if (exportMenuOpen) {
-      setExportMenuOpen(false);
-      return;
-    }
     if (ttsSettingsOpen) {
       setTtsSettingsOpen(false);
       return;
@@ -1350,6 +1346,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     return resolveReaderFontFamilyCss(fontId);
   };
 
+  const handleSelectAnnotation = useCallback((ann: Annotation) => {
+    setSelectionState(null);
+    setActiveInspectAnnotation(ann);
+    setEditAnnNote(ann.noteText || '');
+    setEditAnnColor(ann.color || 'amber');
+  }, []);
+
   const renderPageParagraphs = (page: VirtualPage | undefined) => {
     if (!page) {
       return (
@@ -1369,12 +1372,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         settings={settings}
         annotations={annotations}
         searchHighlightQuery={fullTextSearchQuery}
-        onSelectAnnotation={(ann) => {
-          setSelectionState(null);
-          setActiveInspectAnnotation(ann);
-          setEditAnnNote(ann.noteText || '');
-          setEditAnnColor(ann.color || 'amber');
-        }}
+        onSelectAnnotation={handleSelectAnnotation}
         forceMermaidTD={forceMermaidTD}
         mermaidContainerWidth={mermaidContainerWidth}
         isLastBlock={idx === page.paragraphs.length - 1}
@@ -1451,13 +1449,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const canGoPrev = !isPaginated || pageIndex > 0;
   const canGoNext = !isPaginated || pageIndex + pageStep < totalPages;
 
-  const notesWithThoughtsCount = useMemo(
-    () => annotations.filter((a) => Boolean(a.noteText && a.noteText.trim())).length,
-    [annotations]
-  );
-
-  const [quickMermaidTick, setQuickMermaidTick] = useState(0);
-
   // Sync PDF export theme & font style with the Reader's active display theme & font family
   useEffect(() => {
     const mappedTheme: ExportThemeStyle =
@@ -1483,53 +1474,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       themeStyle: mappedTheme,
       fontStyle: mappedFont,
     }));
-    warmUpCjkPdfFont(mappedFont);
-  }, [settings.theme, settings.fontFamily]);
-
-  useEffect(() => {
-    if (!book?.content) return;
-    let cancelled = false;
-    warmUpMermaidDiagramsForContent(book.content, quickPdfConfig.themeStyle)
-      .then(() => {
-        if (!cancelled) setQuickMermaidTick((t) => t + 1);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [exportMenuOpen, book.id, book.content, quickPdfConfig.themeStyle]);
-
-  const quickPdfPreview = useMemo(() => {
-    if (!exportMenuOpen) return null;
-    warmUpCjkPdfFont(quickPdfConfig.fontStyle || 'serif');
-    return renderJsPdfPages(book, annotations, dailyStats, quickPdfConfig, Infinity);
-  }, [exportMenuOpen, book, annotations, dailyStats, quickPdfConfig, quickMermaidTick]);
-
-  const handleQuickJsPdfDownload = async () => {
-    const synced: ExportConfig = {
-      ...quickPdfConfig,
-      format: 'pdf',
-      includeAnnotations: Boolean(quickPdfConfig.includeNotes || quickPdfConfig.includeExcerpts),
-    };
-    setQuickPdfFeedback('正在渲染全书 Mermaid 图表并生成矢量 PDF...');
-    const res = await exportBookWithJsPdf(book, annotations, dailyStats, synced);
-    setQuickPdfFeedback(`已完整生成 ${res.totalPages} 页矢量 PDF（含图表）`);
-    setTimeout(() => setQuickPdfFeedback(null), 2600);
-  };
-
-  const handleQuickNativePrint = async () => {
-    const synced: ExportConfig = {
-      ...quickPdfConfig,
-      format: 'pdf',
-      includeAnnotations: Boolean(quickPdfConfig.includeNotes || quickPdfConfig.includeExcerpts),
-    };
-    setQuickPdfFeedback('正在准备全书图表与矢量打印排版...');
-    await warmUpMermaidDiagramsForContent(book.content, synced.themeStyle);
-    const fullResult = renderJsPdfPages(book, annotations, dailyStats, synced, Infinity);
-    printDocumentViaHiddenIframe(fullResult.vectorPrintHtml);
-    setQuickPdfFeedback(`已唤起全书 ${fullResult.totalPages} 页 A4 矢量打印`);
-    setTimeout(() => setQuickPdfFeedback(null), 2600);
-  };
+    if (exportModalOpen) {
+      warmUpCjkPdfFont(mappedFont);
+    }
+  }, [settings.theme, settings.fontFamily, exportModalOpen]);
 
   return (
     <div
@@ -1705,7 +1653,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             <button
               type="button"
               onClick={() => {
-                setExportMenuOpen(false);
                 setActiveDrawer('none');
                 setTtsBarOpen(true);
                 if (ttsStatus === 'idle') {
@@ -1792,7 +1739,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               <button
                 type="button"
                 onClick={() => {
-                  setExportMenuOpen(false);
                   setActiveDrawer('none');
                   setTtsSettingsOpen((v) => !v);
                 }}
@@ -1858,307 +1804,28 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             />
           </button>
 
-          {/* Top-Bar Export Dropdown Menu (PDF with Body / Notes / Excerpts & jsPDF Preview/Download) */}
-          <div className="relative" onClick={(e) => e.stopPropagation()}>
-            <button
-              type="button"
-              onClick={() => {
-                setExportMenuOpen((v) => !v);
-                setActiveDrawer('none');
-              }}
-              className="flex h-9 w-9 items-center justify-center rounded-xl transition-colors"
-              style={{
-                backgroundColor:
-                  exportMenuOpen || exportModalOpen ? 'var(--accent-primary)' : 'var(--bg-page)',
-                color: exportMenuOpen || exportModalOpen ? '#FFFFFF' : 'var(--text-primary)',
-                border: '1px solid var(--border-subtle)',
-              }}
-              title="导出菜单：选择正文、笔记或书摘并预览下载 PDF"
-              aria-label="导出菜单"
-            >
-              <Download className="h-4 w-4" />
-            </button>
-
-            {exportMenuOpen && (
-              <div
-                className="absolute top-11 right-0 z-50 w-80 rounded-2xl p-3.5 shadow-2xl sm:w-88"
-                style={{
-                  backgroundColor: 'var(--bg-page)',
-                  border: '1px solid var(--border-strong)',
-                  color: 'var(--text-primary)',
-                }}
-              >
-                <div
-                  className="flex items-center justify-between border-b pb-2.5"
-                  style={{ borderColor: 'var(--border-subtle)' }}
-                >
-                  <div className="flex items-center gap-1.5">
-                    <FileText className="h-4 w-4" style={{ color: 'var(--accent-primary)' }} />
-                    <span className="font-display text-xs font-semibold">
-                      jsPDF 精美排版导出菜单
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setExportMenuOpen(false)}
-                    className="flex h-6 w-6 items-center justify-center rounded-lg"
-                    style={{ color: 'var(--text-muted)' }}
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-
-                {/* Content Selection: 正文 / 笔记 / 书摘 */}
-                <div className="mt-3">
-                  <div
-                    className="mb-1.5 flex items-center justify-between text-[11px] font-medium"
-                    style={{ color: 'var(--text-secondary)' }}
-                  >
-                    <span>勾选 PDF 导出内容维度</span>
-                    <span className="font-mono-tabular" style={{ color: 'var(--text-muted)' }}>
-                      可多选组合
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-3 gap-1.5">
-                    {[
-                      {
-                        key: 'includeFullText' as const,
-                        label: '正文',
-                        meta: `${(book.totalChars / 1000).toFixed(1)}k字`,
-                        checked: Boolean(quickPdfConfig.includeFullText),
-                      },
-                      {
-                        key: 'includeNotes' as const,
-                        label: '笔记',
-                        meta: `${notesWithThoughtsCount} 篇`,
-                        checked: Boolean(quickPdfConfig.includeNotes),
-                      },
-                      {
-                        key: 'includeExcerpts' as const,
-                        label: '书摘',
-                        meta: `${annotations.length} 条`,
-                        checked: Boolean(quickPdfConfig.includeExcerpts),
-                      },
-                    ].map((opt) => (
-                      <label
-                        key={opt.key}
-                        className="flex cursor-pointer flex-col justify-between rounded-xl p-2 text-xs transition-all"
-                        style={{
-                          backgroundColor: opt.checked
-                            ? 'var(--accent-soft)'
-                            : 'var(--bg-surface)',
-                          border: opt.checked
-                            ? '1px solid var(--accent-primary)'
-                            : '1px solid var(--border-subtle)',
-                        }}
-                      >
-                        <div className="flex items-center justify-between">
-                          <span
-                            className="font-semibold"
-                            style={{
-                              color: opt.checked
-                                ? 'var(--accent-primary)'
-                                : 'var(--text-primary)',
-                            }}
-                          >
-                            {opt.label}
-                          </span>
-                          <input
-                            type="checkbox"
-                            checked={opt.checked}
-                            onChange={(e) => {
-                              const val = e.target.checked;
-                              setQuickPdfConfig((prev) => ({
-                                ...prev,
-                                [opt.key]: val,
-                                includeAnnotations: Boolean(
-                                  (opt.key === 'includeNotes' ? val : prev.includeNotes) ||
-                                    (opt.key === 'includeExcerpts' ? val : prev.includeExcerpts)
-                                ),
-                              }));
-                            }}
-                            className="h-3.5 w-3.5 accent-[#B4532A]"
-                          />
-                        </div>
-                        <span
-                          className="font-mono-tabular mt-1 text-[10px]"
-                          style={{ color: 'var(--text-muted)' }}
-                        >
-                          {opt.meta}
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Paper Theme Selector */}
-                <div className="mt-2.5">
-                  <div
-                    className="mb-1 text-[11px] font-medium"
-                    style={{ color: 'var(--text-secondary)' }}
-                  >
-                    PDF 典藏纸张配色
-                  </div>
-                  <div className="grid grid-cols-4 gap-1">
-                    {(
-                      [
-                        { id: 'parchment', label: '羊皮', hex: '#FBF7F0' },
-                        { id: 'caramel', label: '焦糖', hex: '#F7EEDF' },
-                        { id: 'espresso', label: '夜读', hex: '#211A15' },
-                        { id: 'eink', label: '墨水', hex: '#F7F7F7' },
-                      ] as { id: ExportThemeStyle; label: string; hex: string }[]
-                    ).map((t) => {
-                      const active = quickPdfConfig.themeStyle === t.id;
-                      return (
-                        <button
-                          key={t.id}
-                          type="button"
-                          onClick={() =>
-                            setQuickPdfConfig((prev) => ({ ...prev, themeStyle: t.id }))
-                          }
-                          className="flex items-center justify-center gap-1 rounded-lg py-1 text-[11px] font-medium"
-                          style={{
-                            backgroundColor: active
-                              ? 'var(--accent-primary)'
-                              : 'var(--bg-surface)',
-                            color: active ? '#FFFFFF' : 'var(--text-primary)',
-                            border: '1px solid var(--border-subtle)',
-                          }}
-                        >
-                          <span
-                            className="h-2 w-2 rounded-full border border-black/20"
-                            style={{ backgroundColor: t.hex }}
-                          />
-                          <span>{t.label}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* Live Mini A4 Preview Card */}
-                {quickPdfPreview && quickPdfPreview.pageDataUrls[0] && (
-                  <div
-                    className="mt-2.5 flex items-center gap-3 rounded-xl p-2"
-                    style={{
-                      backgroundColor: 'var(--bg-surface)',
-                      border: '1px solid var(--border-subtle)',
-                    }}
-                  >
-                    <img
-                      src={quickPdfPreview.pageDataUrls[0]}
-                      alt="PDF 首页实时排版预览"
-                      className="h-20 w-14 shrink-0 rounded border object-cover shadow-xs"
-                      style={{ borderColor: 'var(--border-strong)' }}
-                    />
-                    <div className="min-w-0 flex-1 space-y-1 text-[11px]">
-                      <div className="font-semibold truncate">《{book.title}》A4 预检</div>
-                      <div style={{ color: 'var(--text-secondary)' }}>
-                        已勾选：
-                        {[
-                          quickPdfConfig.includeFullText ? '正文' : null,
-                          quickPdfConfig.includeNotes ? '笔记' : null,
-                          quickPdfConfig.includeExcerpts ? '书摘' : null,
-                        ]
-                          .filter(Boolean)
-                          .join(' + ') || '仅封面'}
-                      </div>
-                      <div
-                        className="font-mono-tabular text-[10px]"
-                        style={{ color: 'var(--accent-primary)' }}
-                      >
-                        双击或点击下方按钮打开多页大图预览
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {quickPdfFeedback && (
-                  <div
-                    className="mt-2 flex items-center justify-center gap-1.5 rounded-lg py-1 text-[11px] font-medium"
-                    style={{
-                      backgroundColor: 'var(--accent-soft)',
-                      color: 'var(--accent-primary)',
-                    }}
-                  >
-                    <Check className="h-3.5 w-3.5" />
-                    <span>{quickPdfFeedback}</span>
-                  </div>
-                )}
-
-                {/* Primary Actions: Preview Studio & Direct Download */}
-                <div className="mt-3 space-y-1.5">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setExportInitialFormat('pdf');
-                      setExportMenuOpen(false);
-                      setExportModalOpen(true);
-                    }}
-                    className="flex w-full items-center justify-center gap-1.5 rounded-xl py-2 text-xs font-semibold text-white transition-transform active:scale-[0.99]"
-                    style={{ backgroundColor: 'var(--accent-primary)' }}
-                  >
-                    <Eye className="h-3.5 w-3.5" />
-                    <span>精美 PDF 排版预览与下载</span>
-                  </button>
-
-                  <div className="grid grid-cols-3 gap-1.5">
-                    <button
-                      type="button"
-                      onClick={handleQuickJsPdfDownload}
-                      className="flex items-center justify-center gap-1 rounded-xl py-1.5 text-xs font-medium"
-                      style={{
-                        backgroundColor: 'var(--bg-surface)',
-                        color: 'var(--text-primary)',
-                        border: '1px solid var(--border-strong)',
-                      }}
-                      title="下载内嵌中文字体的矢量 PDF"
-                    >
-                      <Download className="h-3.5 w-3.5" style={{ color: 'var(--accent-primary)' }} />
-                      <span>下载 .pdf</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={handleQuickNativePrint}
-                      className="flex items-center justify-center gap-1 rounded-xl py-1.5 text-xs font-medium"
-                      style={{
-                        backgroundColor: 'var(--bg-surface)',
-                        color: 'var(--text-primary)',
-                        border: '1px solid var(--border-strong)',
-                      }}
-                      title="唤起无页眉 A4 矢量打印"
-                    >
-                      <Printer className="h-3.5 w-3.5" style={{ color: 'var(--accent-primary)' }} />
-                      <span>直接打印</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setExportInitialFormat('md');
-                        setExportMenuOpen(false);
-                        setExportModalOpen(true);
-                      }}
-                      className="flex items-center justify-center gap-1 rounded-xl py-1.5 text-xs font-medium"
-                      style={{
-                        backgroundColor: 'var(--bg-surface)',
-                        color: 'var(--text-secondary)',
-                        border: '1px solid var(--border-subtle)',
-                      }}
-                    >
-                      <Sparkles className="h-3.5 w-3.5" />
-                      <span>更多格式</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
+          {/* Direct 1-Click Icon Trigger to Open Export Studio */}
+          <button
+            type="button"
+            onClick={() => {
+              setActiveDrawer('none');
+              setExportInitialFormat('pdf');
+              setExportModalOpen(true);
+            }}
+            className="flex h-9 w-9 items-center justify-center rounded-xl transition-colors"
+            style={{
+              backgroundColor: exportModalOpen ? 'var(--accent-primary)' : 'var(--bg-page)',
+              color: exportModalOpen ? '#FFFFFF' : 'var(--text-primary)',
+              border: '1px solid var(--border-subtle)',
+            }}
+            title="导出工作台 (PDF / MD / HTML / TXT / CSV / JSON)"
+            aria-label="导出工作台"
+          >
+            <Download className="h-4 w-4" />
+          </button>
 
           <button
             onClick={() => {
-              setExportMenuOpen(false);
               if (activeDrawer === 'toc' && tocTab === 'search') {
                 setActiveDrawer('none');
               } else {
@@ -2187,7 +1854,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
           <button
             onClick={() => {
-              setExportMenuOpen(false);
               if (activeDrawer === 'toc' && tocTab !== 'search') {
                 setActiveDrawer('none');
               } else {
@@ -2215,7 +1881,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
           <button
             onClick={() => {
-              setExportMenuOpen(false);
               setActiveDrawer(activeDrawer === 'settings' ? 'none' : 'settings');
             }}
             className="flex h-9 w-9 items-center justify-center rounded-xl transition-colors"
@@ -2487,7 +2152,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 style={{ maxWidth: singlePageMaxWidthCss }}
               >
                 {virtualPages.map((page) => (
-                  <div key={page.pageNumber}>{renderPageParagraphs(page)}</div>
+                  <div
+                    key={page.pageNumber}
+                    style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 680px' }}
+                  >
+                    {renderPageParagraphs(page)}
+                  </div>
                 ))}
               </div>
             </div>
@@ -2935,13 +2605,22 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 if (ttsBarOpen) {
                   syncTtsToPage(originIdx);
                 }
-                if (!isPaginated && scrollContainerRef.current && book.totalChars > 0) {
+                if (!isPaginated && scrollContainerRef.current) {
                   const el = scrollContainerRef.current;
-                  const maxScroll = Math.max(1, el.scrollHeight - el.clientHeight);
-                  el.scrollTo({
-                    top: (originOffset / book.totalChars) * maxScroll,
-                    behavior: 'smooth',
-                  });
+                  const targetPage = virtualPages[originIdx];
+                  const firstBlockOffset = targetPage?.paragraphs[0]?.startOffset ?? originOffset;
+                  const blockEl = el.querySelector(
+                    `[data-start-offset="${firstBlockOffset}"]`
+                  ) as HTMLElement | null;
+                  if (blockEl) {
+                    blockEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                  } else if (book.totalChars > 0) {
+                    const maxScroll = Math.max(1, el.scrollHeight - el.clientHeight);
+                    el.scrollTo({
+                      top: (originOffset / book.totalChars) * maxScroll,
+                      behavior: 'smooth',
+                    });
+                  }
                 }
               }}
               className="flex items-center gap-1.5 font-medium hover:underline"
@@ -3323,22 +3002,25 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </>
             ) : tocTab === 'annotations' ? (
               <>
-                <div className="mt-3 flex justify-end gap-1.5">
+                <div className="mt-3 flex items-center justify-between text-[11px]">
+                  <span className="font-mono-tabular" style={{ color: 'var(--text-muted)' }}>
+                    共 {annotations.length} 条记录
+                  </span>
                   <button
                     onClick={() => {
                       setActiveDrawer('none');
                       setExportModalOpen(true);
                     }}
-                    className="flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium"
+                    className="flex h-7 w-7 items-center justify-center rounded-lg transition-colors hover:opacity-85"
                     style={{
                       backgroundColor: 'var(--bg-surface)',
                       color: 'var(--accent-primary)',
                       border: '1px solid var(--border-subtle)',
                     }}
-                    title="打开多格式导出中心"
+                    title="导出书摘与笔记"
+                    aria-label="导出书摘与笔记"
                   >
                     <Download className="h-3.5 w-3.5" />
-                    <span>多格式导出</span>
                   </button>
                 </div>
 

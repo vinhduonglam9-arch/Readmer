@@ -34,6 +34,7 @@ import {
 import {
   decodeFileBuffer,
   extractChapters,
+  parseImportedBookMetadata,
   validateBackupJson,
 } from './core/parserEngine';
 import {
@@ -214,9 +215,38 @@ export default function App() {
     document.documentElement.setAttribute('data-theme', settings.theme);
   }, [settings.theme]);
 
-  // Immediately wipe in-memory key and plaintext maps
+  const persistBookTimersRef = useRef<Record<string, number>>({});
+  const pendingBooksToPersistRef = useRef<
+    Record<string, { book: Book; isPrivate: boolean; key: CryptoKey | null }>
+  >({});
+
+  const flushPendingBookPersistences = useCallback(() => {
+    const pendingEntries = Object.entries(pendingBooksToPersistRef.current);
+    pendingBooksToPersistRef.current = {};
+    Object.values(persistBookTimersRef.current).forEach((timerId) => {
+      window.clearTimeout(timerId);
+    });
+    persistBookTimersRef.current = {};
+
+    for (const [bookId, pending] of pendingEntries) {
+      if (pending.isPrivate) {
+        const keyToUse = pending.key || vaultKeyRef.current;
+        if (keyToUse) {
+          encryptBookForStorage(pending.book, keyToUse).then((enc) => {
+            saveBook(enc);
+            setBooks((bList) => bList.map((b) => (b.id === bookId ? enc : b)));
+          });
+        }
+      } else {
+        saveBook(pending.book);
+      }
+    }
+  }, []);
+
+  // Immediately flush any pending progress writes, then wipe in-memory key and plaintext maps
   const wipeSessionMemoryAndLock = useCallback(
     (exitToPublicShelf: boolean) => {
+      flushPendingBookPersistences();
       vaultKeyRef.current = null;
       clearVaultSessionAuthorization();
       setIsVaultUnlocked(false);
@@ -234,7 +264,7 @@ export default function App() {
         setIsShieldLockedInPlace(true);
       }
     },
-    [books]
+    [books, flushPendingBookPersistences]
   );
 
   const handleLockVaultAndExit = useCallback(() => {
@@ -856,13 +886,44 @@ export default function App() {
     [books, decryptedBooksMap]
   );
 
+  const scheduleBookPersistence = useCallback((bookToSave: Book, isPrivate: boolean) => {
+    const bookId = bookToSave.id;
+    const capturedKey = vaultKeyRef.current;
+    pendingBooksToPersistRef.current[bookId] = {
+      book: bookToSave,
+      isPrivate,
+      key: capturedKey,
+    };
+    if (persistBookTimersRef.current[bookId]) {
+      window.clearTimeout(persistBookTimersRef.current[bookId]);
+    }
+    persistBookTimersRef.current[bookId] = window.setTimeout(() => {
+      delete persistBookTimersRef.current[bookId];
+      const pending = pendingBooksToPersistRef.current[bookId];
+      delete pendingBooksToPersistRef.current[bookId];
+      if (!pending) return;
+
+      if (pending.isPrivate) {
+        const keyToUse = pending.key || vaultKeyRef.current;
+        if (keyToUse) {
+          encryptBookForStorage(pending.book, keyToUse).then((enc) => {
+            saveBook(enc);
+            setBooks((bList) => bList.map((b) => (b.id === bookId ? enc : b)));
+          });
+        }
+      } else {
+        saveBook(pending.book);
+      }
+    }, 1200);
+  }, []);
+
   const handleUpdateBookOffset = useCallback(
     async (bookId: string, newOffset: number, secondsDelta = 0, charsDelta = 0) => {
       const now = Date.now();
       const target = books.find((b) => b.id === bookId);
 
       if (target?.isPrivate) {
-        // Zero-latency in-memory state update for 60fps reading
+        // Zero-latency in-memory state update for 60fps reading, debounced AES-GCM + IndexedDB write
         setDecryptedBooksMap((prev) => {
           const currentPlain = prev[bookId];
           if (!currentPlain) return prev;
@@ -872,12 +933,7 @@ export default function App() {
             lastReadAt: now,
             readingTimeSeconds: currentPlain.readingTimeSeconds + secondsDelta,
           };
-          if (vaultKeyRef.current) {
-            encryptBookForStorage(updatedPlain, vaultKeyRef.current).then((enc) => {
-              saveBook(enc);
-              setBooks((bList) => bList.map((b) => (b.id === bookId ? enc : b)));
-            });
-          }
+          scheduleBookPersistence(updatedPlain, true);
           return { ...prev, [bookId]: updatedPlain };
         });
 
@@ -902,7 +958,7 @@ export default function App() {
             lastReadAt: now,
             readingTimeSeconds: b.readingTimeSeconds + secondsDelta,
           };
-          saveBook(updated);
+          scheduleBookPersistence(updated, false);
           return updated;
         })
       );
@@ -916,7 +972,7 @@ export default function App() {
         });
       }
     },
-    [books]
+    [books, scheduleBookPersistence]
   );
 
   const handleImportFiles = useCallback(
@@ -943,23 +999,56 @@ export default function App() {
         if (lowerName.endsWith('.json')) {
           const text = await file.text();
           const backup = validateBackupJson(text);
-          if (backup) {
-            await restoreFullLibraryBackup(backup);
-            const refreshed = await initializeLibraryStorage();
-            setBooks(refreshed.books);
-            setAnnotations(refreshed.annotations);
-            setDailyStats(refreshed.dailyStats);
-            setSettings(refreshed.settings);
-            if (vaultKeyRef.current) {
-              await hydratePrivateVaultIntoMemory(
-                vaultKeyRef.current,
-                refreshed.books,
-                refreshed.annotations
-              );
-            }
-            showNotice(`已恢复 ${refreshed.books.length} 册书籍`);
+          if (!backup) {
+            showNotice(`《${file.name}》不是有效的 JSON 备份或数据归档文件`);
             continue;
           }
+
+          if (importAsPrivate && keyForPrivate) {
+            // When importing a JSON book archive directly inside Private Space mode,
+            // encrypt unencrypted books & annotations into the Private Vault.
+            for (const b of backup.books) {
+              if (b.isPrivate) {
+                await saveBook(b);
+              } else {
+                const privateBook: Book = { ...b, isPrivate: true };
+                const encBook = await encryptBookForStorage(privateBook, keyForPrivate);
+                await saveBook(encBook);
+                setDecryptedBooksMap((prev) => ({ ...prev, [privateBook.id]: privateBook }));
+              }
+            }
+            for (const a of backup.annotations) {
+              if (a.isPrivate) {
+                await saveAnnotation(a);
+              } else {
+                const privateAnn: Annotation = { ...a, isPrivate: true };
+                const encAnn = await encryptAnnotationForStorage(privateAnn, keyForPrivate);
+                await saveAnnotation(encAnn);
+                setDecryptedAnnsMap((prev) => ({ ...prev, [privateAnn.id]: privateAnn }));
+              }
+            }
+          } else {
+            await restoreFullLibraryBackup(backup);
+          }
+
+          const refreshed = await initializeLibraryStorage();
+          setBooks(refreshed.books);
+          setAnnotations(refreshed.annotations);
+          setDailyStats(refreshed.dailyStats);
+          setSettings(refreshed.settings);
+          if (vaultKeyRef.current) {
+            await hydratePrivateVaultIntoMemory(
+              vaultKeyRef.current,
+              refreshed.books,
+              refreshed.annotations
+            );
+          }
+          showNotice(
+            importAsPrivate
+              ? `已加密恢复 ${backup.books.length} 册书籍至私密空间`
+              : `已恢复 ${backup.books.length} 册书籍与 ${backup.annotations.length} 条批注`
+          );
+          continue;
         }
 
         const buffer = await file.arrayBuffer();
@@ -968,22 +1057,21 @@ export default function App() {
 
         const format: BookFormat =
           lowerName.endsWith('.md') || lowerName.endsWith('.markdown') ? 'md' : 'txt';
-        const cleanTitle = file.name
-          .replace(/\.(txt|md|markdown)$/i, '')
-          .replace(/^[《【]|[》】]$/g, '');
-        const chapters = extractChapters(text, format);
+        const parsedMeta = parseImportedBookMetadata(text, file.name, format);
+        const cleanBody = parsedMeta.content.trim() ? parsedMeta.content : text;
+        const chapters = extractChapters(cleanBody, format);
         const preset = COVER_ROTATION[(books.length + i) % COVER_ROTATION.length];
 
         const newBook: Book = {
           id: `book-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          title: cleanTitle || '未命名手稿',
-          author: '本地典藏',
-          category: format === 'md' ? 'Markdown' : '书卷',
+          title: parsedMeta.title || '未命名手稿',
+          author: parsedMeta.author || '本地典藏',
+          category: parsedMeta.category || (format === 'md' ? 'Markdown' : '书卷'),
           format,
           encoding,
           coverPreset: preset,
-          content: text,
-          totalChars: text.length,
+          content: cleanBody,
+          totalChars: cleanBody.length,
           chapters,
           currentOffset: 0,
           isFavorite: false,
@@ -1018,7 +1106,13 @@ export default function App() {
         );
       }
     },
-    [books.length, isPrivateSpaceMode, markFileDialogClosed, showNotice]
+    [
+      books.length,
+      hydratePrivateVaultIntoMemory,
+      isPrivateSpaceMode,
+      markFileDialogClosed,
+      showNotice,
+    ]
   );
 
   const handleToggleFavorite = useCallback(
@@ -1050,6 +1144,12 @@ export default function App() {
 
   const handleDeleteBook = useCallback(
     async (bookId: string) => {
+      if (persistBookTimersRef.current[bookId]) {
+        window.clearTimeout(persistBookTimersRef.current[bookId]);
+        delete persistBookTimersRef.current[bookId];
+      }
+      delete pendingBooksToPersistRef.current[bookId];
+
       await removeBook(bookId);
       setDecryptedBooksMap((prev) => {
         const next = { ...prev };
@@ -1059,7 +1159,9 @@ export default function App() {
       setBooks((prev) => {
         const remaining = prev.filter((b) => b.id !== bookId);
         if (activeBookId === bookId) {
-          const fallback = remaining.find((b) => !b.isPrivate);
+          const fallback =
+            remaining.find((b) => Boolean(b.isPrivate) === isPrivateSpaceMode) ||
+            remaining.find((b) => !b.isPrivate);
           setActiveBookId(fallback?.id || null);
         }
         return remaining;
@@ -1067,7 +1169,7 @@ export default function App() {
       setAnnotations((prev) => prev.filter((a) => a.bookId !== bookId));
       showNotice('已移除');
     },
-    [activeBookId, showNotice]
+    [activeBookId, isPrivateSpaceMode, showNotice]
   );
 
   const handleUpdateBookMeta = useCallback(

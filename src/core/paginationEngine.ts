@@ -86,13 +86,16 @@ function estimateBlockLines(
   }
 }
 
-function isInsideMarkdownDelimiter(text: string, idx: number): boolean {
-  const prefix = text.slice(0, idx);
-  const backticks = (prefix.match(/`/g) || []).length;
-  if (backticks % 2 !== 0) return true;
-  const asterisks = (prefix.match(/\*/g) || []).length;
-  if (asterisks % 2 !== 0) return true;
-  return false;
+function isInsideMarkdownDelimiter(text: string, idx: number, hasDelimiters: boolean): boolean {
+  if (!hasDelimiters) return false;
+  let backticks = 0;
+  let asterisks = 0;
+  for (let i = 0; i < idx; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 96) backticks++; // '`'
+    else if (code === 42) asterisks++; // '*'
+  }
+  return (backticks & 1) !== 0 || (asterisks & 1) !== 0;
 }
 
 /**
@@ -106,6 +109,7 @@ function findSafeSentenceSplitLength(
   charsPerLine = 20
 ): number {
   if (targetLength >= text.length) return text.length;
+  const hasDelimiters = text.includes('`') || text.includes('*');
   // Look back at most 38% of line width to find a punctuation boundary,
   // preventing loose gaps at the bottom of the page.
   const lookbackSpan = Math.min(16, Math.max(6, Math.floor(charsPerLine * 0.38)));
@@ -115,7 +119,7 @@ function findSafeSentenceSplitLength(
   const sentencePunct = '。！？；…\n.!?';
   for (let i = targetLength; i >= minLookback; i--) {
     if (sentencePunct.includes(text[i - 1])) {
-      if (!isInsideMarkdownDelimiter(text, i)) {
+      if (!isInsideMarkdownDelimiter(text, i, hasDelimiters)) {
         return i;
       }
     }
@@ -125,7 +129,7 @@ function findSafeSentenceSplitLength(
   const clausePunct = '，、：:—“”‘’()（）';
   for (let i = targetLength; i >= minLookback; i--) {
     if (clausePunct.includes(text[i - 1])) {
-      if (!isInsideMarkdownDelimiter(text, i)) {
+      if (!isInsideMarkdownDelimiter(text, i, hasDelimiters)) {
         return i;
       }
     }
@@ -140,7 +144,7 @@ function findSafeSentenceSplitLength(
 
   // 4. Default: split at targetLength safely without breaking inside markdown delimiters
   let safeIdx = targetLength;
-  while (safeIdx > minLookback && isInsideMarkdownDelimiter(text, safeIdx)) {
+  while (safeIdx > minLookback && isInsideMarkdownDelimiter(text, safeIdx, hasDelimiters)) {
     safeIdx--;
   }
   return safeIdx;
@@ -726,26 +730,45 @@ export function paginateBookContent(
 }
 
 export function findPageIndexForOffset(pages: VirtualPage[], offset: number): number {
-  if (pages.length <= 1) return 0;
-  if (offset <= 0) return 0;
+  const len = pages.length;
+  if (len <= 1 || offset <= 0) return 0;
+  if (offset >= pages[len - 1].startOffset) return len - 1;
 
-  for (let i = 0; i < pages.length; i++) {
-    const isLast = i === pages.length - 1;
-    if (offset >= pages[i].startOffset && (offset < pages[i].endOffset || isLast)) {
-      return i;
+  let low = 0;
+  let high = len - 1;
+  while (low <= high) {
+    const mid = (low + high) >>> 1;
+    const p = pages[mid];
+    if (offset < p.startOffset) {
+      high = mid - 1;
+    } else if (offset >= p.endOffset && mid < len - 1) {
+      low = mid + 1;
+    } else {
+      return mid;
     }
   }
-  return pages.length - 1;
+  return Math.max(0, Math.min(len - 1, low));
 }
 
 export function findChapterTitleAtOffset(chapters: Chapter[], offset: number): string {
   if (!chapters || chapters.length === 0) return '正文';
-  for (let i = chapters.length - 1; i >= 0; i--) {
-    if (offset >= chapters[i].startOffset) {
-      return chapters[i].title;
+  if (offset <= chapters[0].startOffset) return chapters[0].title;
+  const len = chapters.length;
+  if (offset >= chapters[len - 1].startOffset) return chapters[len - 1].title;
+
+  let low = 0;
+  let high = len - 1;
+  let bestIdx = 0;
+  while (low <= high) {
+    const mid = (low + high) >>> 1;
+    if (chapters[mid].startOffset <= offset) {
+      bestIdx = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
     }
   }
-  return chapters[0].title;
+  return chapters[bestIdx].title;
 }
 
 export interface InstalledSystemFont {

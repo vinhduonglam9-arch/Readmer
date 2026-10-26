@@ -10,7 +10,7 @@ import {
   warmUpMermaidDiagramsForContent,
 } from './parserEngine';
 
-export type ExportFormat = 'md' | 'epub' | 'pdf' | 'html' | 'txt' | 'csv' | 'json';
+export type ExportFormat = 'md' | 'pdf' | 'html' | 'txt' | 'csv' | 'json';
 
 export type ExportThemeStyle = 'parchment' | 'caramel' | 'espresso' | 'eink';
 
@@ -382,8 +382,10 @@ export function buildStructuredJsonExport(
   const showNotes = config.includeNotes ?? config.includeAnnotations;
 
   const payload = {
+    version: '2.0.0',
     exportedAt: new Date().toISOString(),
     exportConfig: config,
+    dailyStats: config.includeStats ? dailyStats : undefined,
     books: books.map((book) => {
       const bookAnns = annotations
         .filter((a) => a.bookId === book.id)
@@ -402,14 +404,22 @@ export function buildStructuredJsonExport(
         category: book.category,
         format: book.format,
         totalChars: book.totalChars,
+        currentOffset: book.currentOffset,
+        readingTimeSeconds: book.readingTimeSeconds,
+        coverPreset: book.coverPreset,
+        isFavorite: Boolean(book.isFavorite),
+        encoding: book.encoding || 'UTF-8',
+        addedAt: book.addedAt,
+        lastReadAt: book.lastReadAt,
         stats: config.includeStats ? metrics : undefined,
         outline: config.includeOutline ? chapters : undefined,
+        chapters: config.includeOutline ? chapters : undefined,
         annotations:
           showExcerpts || showNotes
             ? filteredAnns.map((a) => ({
                 ...a,
-                selectedText: showExcerpts ? a.selectedText : undefined,
-                noteText: showNotes ? a.noteText : undefined,
+                selectedText: showExcerpts ? a.selectedText : '',
+                noteText: showNotes ? a.noteText : '',
               }))
             : undefined,
         content: config.includeFullText
@@ -863,453 +873,7 @@ export function printDocumentViaHiddenIframe(htmlContent: string): void {
   }
 }
 
-/**
- * 5. Pure Frontend Standard EPUB 3 (.epub) Binary ZIP Builder
- * Packs `mimetype`, `META-INF/container.xml`, `OEBPS/content.opf`, `OEBPS/toc.ncx`,
- * `OEBPS/nav.xhtml`, `OEBPS/style.css`, and chapter XHTML files into a valid `.epub` archive.
- */
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) {
-    let c = i;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[i] = c >>> 0;
-  }
-  return table;
-})();
 
-function crc32(bytes: Uint8Array): number {
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) {
-    crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-interface ZipEntryInput {
-  path: string;
-  content: Uint8Array;
-}
-
-function createStoreZipArchive(entries: ZipEntryInput[]): Blob {
-  const encoder = new TextEncoder();
-  const localFileParts: Uint8Array[] = [];
-  const centralDirParts: Uint8Array[] = [];
-  let offset = 0;
-
-  for (const entry of entries) {
-    const nameBytes = encoder.encode(entry.path);
-    const dataBytes = entry.content;
-    const crc = crc32(dataBytes);
-    const size = dataBytes.length;
-
-    // Local file header (30 bytes + file name)
-    const localHeader = new Uint8Array(30 + nameBytes.length);
-    const lv = new DataView(localHeader.buffer);
-    lv.setUint32(0, 0x04034b50, true); // Local file header signature
-    lv.setUint16(4, 20, true); // Version needed to extract (2.0)
-    lv.setUint16(6, 0x0800, true); // UTF-8 filename flag
-    lv.setUint16(8, 0, true); // Compression method: 0 (STORE)
-    lv.setUint16(10, 0, true); // File last mod time
-    lv.setUint16(12, 0x5421, true); // File last mod date
-    lv.setUint32(14, crc, true); // CRC-32
-    lv.setUint32(18, size, true); // Compressed size
-    lv.setUint32(22, size, true); // Uncompressed size
-    lv.setUint16(26, nameBytes.length, true); // File name length
-    lv.setUint16(28, 0, true); // Extra field length (MUST be 0 for EPUB mimetype)
-    localHeader.set(nameBytes, 30);
-
-    localFileParts.push(localHeader, dataBytes);
-
-    // Central directory file header (46 bytes + file name)
-    const centralHeader = new Uint8Array(46 + nameBytes.length);
-    const cv = new DataView(centralHeader.buffer);
-    cv.setUint32(0, 0x02014b50, true); // Central directory signature
-    cv.setUint16(4, 20, true); // Version made by
-    cv.setUint16(6, 20, true); // Version needed
-    cv.setUint16(8, 0x0800, true); // UTF-8 flag
-    cv.setUint16(10, 0, true); // Compression method: 0 (STORE)
-    cv.setUint16(12, 0, true); // Mod time
-    cv.setUint16(14, 0x5421, true); // Mod date
-    cv.setUint32(16, crc, true); // CRC-32
-    cv.setUint32(20, size, true); // Compressed size
-    cv.setUint32(24, size, true); // Uncompressed size
-    cv.setUint16(28, nameBytes.length, true); // File name length
-    cv.setUint16(30, 0, true); // Extra field length
-    cv.setUint16(32, 0, true); // Comment length
-    cv.setUint16(34, 0, true); // Disk number
-    cv.setUint16(36, 0, true); // Internal attrs
-    cv.setUint32(38, 0, true); // External attrs
-    cv.setUint32(42, offset, true); // Relative offset of local header
-    centralHeader.set(nameBytes, 46);
-
-    centralDirParts.push(centralHeader);
-    offset += localHeader.length + size;
-  }
-
-  const centralDirSize = centralDirParts.reduce((acc, p) => acc + p.length, 0);
-  const eocd = new Uint8Array(22);
-  const ev = new DataView(eocd.buffer);
-  ev.setUint32(0, 0x06054b50, true); // End of central directory signature
-  ev.setUint16(4, 0, true); // Disk number
-  ev.setUint16(6, 0, true); // Start disk
-  ev.setUint16(8, entries.length, true); // Entries on disk
-  ev.setUint16(10, entries.length, true); // Total entries
-  ev.setUint32(12, centralDirSize, true); // Size of central directory
-  ev.setUint32(16, offset, true); // Offset of start of central directory
-  ev.setUint16(20, 0, true); // Comment length
-
-  return new Blob([...localFileParts, ...centralDirParts, eocd] as BlobPart[], {
-    type: 'application/epub+zip',
-  });
-}
-
-function convertChapterTextToXhtmlBody(
-  rawText: string,
-  themeStyle: ExportThemeStyle = 'parchment'
-): string {
-  const blocks = parseDocumentWithMarkdownIt(rawText);
-  const out: string[] = [];
-
-  for (const b of blocks) {
-    if (b.type === 'heading') {
-      const lvl = Math.max(2, Math.min(4, b.level || 2));
-      out.push(`<h${lvl}>${escapeXml(cleanMarkdownLineForPdf(b.text))}</h${lvl}>`);
-    } else if (b.type === 'mermaid') {
-      const diag = getExportedMermaidDiagramSync(b.text, themeStyle);
-      out.push(`<div class="mermaid-box">${diag.svg}</div>`);
-    } else if (b.type === 'table') {
-      const headers = b.tableHeaders || [];
-      const rows = b.tableRows || [];
-      const thead =
-        headers.length > 0
-          ? `<thead><tr>${headers
-              .map((h) => `<th>${escapeXml(cleanMarkdownLineForPdf(h))}</th>`)
-              .join('')}</tr></thead>`
-          : '';
-      const tbody =
-        rows.length > 0
-          ? `<tbody>${rows
-              .map(
-                (r) =>
-                  `<tr>${r
-                    .map((cell) => `<td>${escapeXml(cleanMarkdownLineForPdf(cell))}</td>`)
-                    .join('')}</tr>`
-              )
-              .join('')}</tbody>`
-          : '';
-      out.push(`<table>${thead}${tbody}</table>`);
-    } else if (b.type === 'code') {
-      out.push(`<pre><code>${escapeXml(b.text)}</code></pre>`);
-    } else if (b.type === 'blockquote') {
-      out.push(`<blockquote><p>${escapeXml(cleanMarkdownLineForPdf(b.text))}</p></blockquote>`);
-    } else if (b.type === 'list') {
-      const tag = b.ordered ? 'ol' : 'ul';
-      const items = (b.listItems || [])
-        .map((it) => {
-          const prefix = it.task ? (it.checked ? '☑ ' : '☐ ') : '';
-          return `<li>${escapeXml(prefix + cleanMarkdownLineForPdf(it.text))}</li>`;
-        })
-        .join('');
-      out.push(`<${tag}>${items}</${tag}>`);
-    } else if (b.type === 'hr') {
-      out.push(`<hr/>`);
-    } else if (b.text.trim()) {
-      out.push(`<p>${escapeXml(cleanMarkdownLineForPdf(b.text))}</p>`);
-    }
-  }
-
-  return out.join('\n    ');
-}
-
-export function buildEpubBlob(
-  book: Book,
-  annotations: Annotation[],
-  dailyStats: ReadingStatsDaily[],
-  config: ExportConfig
-): Blob {
-  const encoder = new TextEncoder();
-  const palette = THEME_PALETTES[config.themeStyle] || THEME_PALETTES.parchment;
-  const chapters = getFilteredChaptersForBook(book, config.selectedChapterIds);
-  const sortedAnns = [...annotations].sort((a, b) => a.charOffset - b.charOffset);
-  const notesOnly = sortedAnns.filter((a) => Boolean(a.noteText && a.noteText.trim()));
-  const metrics = getBookReadingMetrics(book, dailyStats);
-  const bookUuid = `urn:uuid:roast-reed-${book.id}`;
-
-  const showExcerpts = config.includeExcerpts ?? config.includeAnnotations;
-  const showNotes = config.includeNotes ?? config.includeAnnotations;
-  const targetAnns = !showExcerpts && showNotes ? notesOnly : sortedAnns;
-
-  const entries: ZipEntryInput[] = [];
-
-  // 1. mimetype (MUST be first file, uncompressed)
-  entries.push({
-    path: 'mimetype',
-    content: encoder.encode('application/epub+zip'),
-  });
-
-  // 2. META-INF/container.xml
-  const containerXml = `<?xml version="1.0" encoding="UTF-8"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-  <rootfiles>
-    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
-  </rootfiles>
-</container>`;
-  entries.push({
-    path: 'META-INF/container.xml',
-    content: encoder.encode(containerXml),
-  });
-
-  // 3. OEBPS/style.css
-  const css = `body {
-  background-color: ${palette.bgPage};
-  color: ${palette.textPrimary};
-  font-family: "Songti SC", "Noto Serif SC", Georgia, serif;
-  line-height: 1.8;
-  margin: 5%;
-}
-h1, h2, h3, h4 {
-  color: ${palette.accent};
-  line-height: 1.35;
-}
-p {
-  text-indent: 2em;
-  margin: 0.6em 0;
-}
-blockquote {
-  margin: 1em 0;
-  padding: 0.6em 1em;
-  background-color: ${palette.bgSurface};
-  border: 1px solid ${palette.border};
-}
-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 1em 0;
-  font-size: 0.9em;
-}
-th, td {
-  border: 1px solid ${palette.border};
-  padding: 6px 10px;
-  text-align: left;
-}
-th {
-  background-color: ${palette.bgSurface};
-  font-weight: bold;
-}
-pre {
-  background-color: ${palette.bgSurface};
-  border: 1px solid ${palette.border};
-  padding: 10px;
-  white-space: pre-wrap;
-  font-family: monospace;
-  font-size: 0.85em;
-}
-.mermaid-box {
-  margin: 1.2em 0;
-  padding: 10px;
-  background-color: ${palette.bgSurface};
-  border: 1px solid ${palette.border};
-  border-radius: 8px;
-  text-align: center;
-}
-.mermaid-box svg {
-  max-width: 100%;
-  height: auto;
-}
-.note-box {
-  margin: 1em 0;
-  padding: 0.8em 1em;
-  background-color: ${palette.bgSurface};
-  border: 1px solid ${palette.border};
-  border-radius: 6px;
-}`;
-  entries.push({
-    path: 'OEBPS/style.css',
-    content: encoder.encode(css),
-  });
-
-  const manifestItems: string[] = [
-    `<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>`,
-    `<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>`,
-    `<item id="css" href="style.css" media-type="text/css"/>`,
-  ];
-  const spineItems: string[] = [];
-  const navLinks: string[] = [];
-  const ncxPoints: string[] = [];
-  let playOrder = 1;
-
-  // Frontmatter & Stats / Annotations Overview Chapter
-  const overviewHtml = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">
-<head>
-  <title>${escapeXml(book.title)} — 馆藏扉页</title>
-  <link rel="stylesheet" type="text/css" href="style.css"/>
-</head>
-<body>
-  <h1>《${escapeXml(book.title)}》</h1>
-  <p style="text-indent:0;">作者：${escapeXml(book.author)} · 分类：${escapeXml(
-    book.category
-  )} · 总字数：${book.totalChars.toLocaleString()} 字</p>
-  ${
-    config.includeStats
-      ? `<div class="note-box">
-          <h3>阅读进度与统计</h3>
-          <p style="text-indent:0;">当前进度：${metrics.progressPct}% · 累计阅读：${metrics.readingMinutes} 分钟 · 批注数：${sortedAnns.length} 条</p>
-        </div>`
-      : ''
-  }
-  ${
-    (showExcerpts || showNotes) && targetAnns.length > 0
-      ? `<h2>精选书摘与批注 (${targetAnns.length})</h2>
-        ${targetAnns
-          .map(
-            (ann, idx) => `<div class="note-box">
-              <p style="text-indent:0;"><strong>#${idx + 1} [${escapeXml(
-              ann.chapterTitle
-            )}]</strong></p>
-              ${
-                showExcerpts
-                  ? `<blockquote><p style="text-indent:0;">「${escapeXml(
-                      ann.selectedText
-                    )}」</p></blockquote>`
-                  : ''
-              }
-              ${
-                showNotes && ann.noteText
-                  ? `<p style="text-indent:0;">批注：${escapeXml(ann.noteText)}</p>`
-                  : ''
-              }
-            </div>`
-          )
-          .join('\n')}`
-      : ''
-  }
-</body>
-</html>`;
-
-  entries.push({
-    path: 'OEBPS/frontmatter.xhtml',
-    content: encoder.encode(overviewHtml),
-  });
-  manifestItems.push(
-    `<item id="frontmatter" href="frontmatter.xhtml" media-type="application/xhtml+xml"/>`
-  );
-  spineItems.push(`<itemref idref="frontmatter"/>`);
-  navLinks.push(`<li><a href="frontmatter.xhtml">扉页与读书手账</a></li>`);
-  ncxPoints.push(`<navPoint id="navPoint-${playOrder}" playOrder="${playOrder}">
-      <navLabel><text>扉页与读书手账</text></navLabel>
-      <content src="frontmatter.xhtml"/>
-    </navPoint>`);
-  playOrder++;
-
-  // Chapters
-  if (config.includeFullText) {
-    chapters.forEach((ch, idx) => {
-      const fileId = `chapter-${idx + 1}`;
-      const fileName = `${fileId}.xhtml`;
-      const rawSlice = book.content.slice(ch.startOffset, ch.endOffset).trim();
-      const bodyXhtml = convertChapterTextToXhtmlBody(rawSlice, config.themeStyle);
-
-      const chXhtml = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN">
-<head>
-  <title>${escapeXml(ch.title)}</title>
-  <link rel="stylesheet" type="text/css" href="style.css"/>
-</head>
-<body>
-  <h2>${escapeXml(ch.title)}</h2>
-  ${bodyXhtml}
-</body>
-</html>`;
-
-      entries.push({
-        path: `OEBPS/${fileName}`,
-        content: encoder.encode(chXhtml),
-      });
-      manifestItems.push(
-        `<item id="${fileId}" href="${fileName}" media-type="application/xhtml+xml"/>`
-      );
-      spineItems.push(`<itemref idref="${fileId}"/>`);
-      navLinks.push(`<li><a href="${fileName}">${escapeXml(ch.title)}</a></li>`);
-      ncxPoints.push(`<navPoint id="navPoint-${playOrder}" playOrder="${playOrder}">
-      <navLabel><text>${escapeXml(ch.title)}</text></navLabel>
-      <content src="${fileName}"/>
-    </navPoint>`);
-      playOrder++;
-    });
-  }
-
-  // OEBPS/nav.xhtml
-  const navXhtml = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="zh-CN">
-<head>
-  <title>目录导航</title>
-  <link rel="stylesheet" type="text/css" href="style.css"/>
-</head>
-<body>
-  <nav epub:type="toc" id="toc">
-    <h1>目录大纲</h1>
-    <ol>
-      ${navLinks.join('\n      ')}
-    </ol>
-  </nav>
-</body>
-</html>`;
-  entries.push({
-    path: 'OEBPS/nav.xhtml',
-    content: encoder.encode(navXhtml),
-  });
-
-  // OEBPS/toc.ncx
-  const tocNcx = `<?xml version="1.0" encoding="UTF-8"?>
-<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
-  <head>
-    <meta name="dtb:uid" content="${escapeXml(bookUuid)}"/>
-    <meta name="dtb:depth" content="2"/>
-    <meta name="dtb:totalPageCount" content="0"/>
-    <meta name="dtb:maxPageNumber" content="0"/>
-  </head>
-  <docTitle><text>${escapeXml(book.title)}</text></docTitle>
-  <navMap>
-    ${ncxPoints.join('\n    ')}
-  </navMap>
-</ncx>`;
-  entries.push({
-    path: 'OEBPS/toc.ncx',
-    content: encoder.encode(tocNcx),
-  });
-
-  // OEBPS/content.opf
-  const modifiedIso = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
-  const contentOpf = `<?xml version="1.0" encoding="UTF-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="BookId">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="BookId">${escapeXml(bookUuid)}</dc:identifier>
-    <dc:title>${escapeXml(book.title)}</dc:title>
-    <dc:creator>${escapeXml(book.author)}</dc:creator>
-    <dc:language>zh-CN</dc:language>
-    <meta property="dcterms:modified">${modifiedIso}</meta>
-  </metadata>
-  <manifest>
-    ${manifestItems.join('\n    ')}
-  </manifest>
-  <spine toc="ncx">
-    ${spineItems.join('\n    ')}
-  </spine>
-</package>`;
-  entries.push({
-    path: 'OEBPS/content.opf',
-    content: encoder.encode(contentOpf),
-  });
-
-  return createStoreZipArchive(entries);
-}
 
 /**
  * 6. High-Resolution Long Image / Quote Card Canvas Renderer (2x Retina PNG)
@@ -3856,6 +3420,69 @@ export async function exportBookWithJsPdf(
     } catch {
       activeFontName = 'helvetica';
     }
+  }
+
+  // If TrueType CJK font could not be loaded (e.g. strict offline environment with empty cache),
+  // rasterize the SVG vector pages at 2x Retina resolution so Chinese text never garbles in Helvetica.
+  if (activeFontName === 'helvetica') {
+    for (let pageIdx = 0; pageIdx < rendered.vectorPages.length; pageIdx++) {
+      const vp = rendered.vectorPages[pageIdx];
+      const svgDataUrl = rendered.pageDataUrls[pageIdx];
+      if (pageIdx > 0) {
+        pdf.addPage('a4', 'portrait');
+      }
+      const [bgR, bgG, bgB] = hexToRgbTuple(vp.bgColor);
+      pdf.setFillColor(bgR, bgG, bgB);
+      pdf.rect(0, 0, vp.widthPt, vp.heightPt, 'F');
+
+      if (svgDataUrl) {
+        const pagePng = await new Promise<string | null>((resolve) => {
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = () => {
+            try {
+              const canvas = document.createElement('canvas');
+              canvas.width = Math.round(vp.widthPt * 2);
+              canvas.height = Math.round(vp.heightPt * 2);
+              const ctx = canvas.getContext('2d');
+              if (!ctx) {
+                resolve(null);
+                return;
+              }
+              ctx.fillStyle = vp.bgColor;
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              resolve(canvas.toDataURL('image/png'));
+            } catch {
+              resolve(null);
+            }
+          };
+          img.onerror = () => resolve(null);
+          img.src = svgDataUrl;
+        });
+
+        if (pagePng) {
+          try {
+            pdf.addImage(
+              pagePng,
+              'PNG',
+              0,
+              0,
+              vp.widthPt,
+              vp.heightPt,
+              undefined,
+              'FAST'
+            );
+          } catch {
+            // ignore image embed error
+          }
+        }
+      }
+    }
+
+    const pdfBlob = pdf.output('blob');
+    triggerBlobDownload(filename, pdfBlob);
+    return rendered;
   }
 
   rendered.vectorPages.forEach((vp, pageIdx) => {
