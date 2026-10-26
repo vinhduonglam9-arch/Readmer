@@ -39,7 +39,12 @@ import {
   triggerBlobDownload,
   warmUpCjkPdfFont,
 } from '../core/exportEngine';
-import { buildTxtExport, extractChapters, triggerFileDownload } from '../core/parserEngine';
+import {
+  buildTxtExport,
+  extractChapters,
+  triggerFileDownload,
+  warmUpMermaidDiagramsForContent,
+} from '../core/parserEngine';
 
 interface ExportStudioModalProps {
   isOpen: boolean;
@@ -63,7 +68,7 @@ const FORMAT_OPTIONS: {
     id: 'pdf',
     label: '矢量文字 PDF',
     ext: '.pdf',
-    desc: 'A4 矢量文字排版、无页眉纯净预览与下载',
+    desc: 'A4 矢量排版、含 Mermaid 图表与表格',
     icon: FileText,
   },
   {
@@ -77,7 +82,7 @@ const FORMAT_OPTIONS: {
     id: 'epub',
     label: 'EPUB 电子书',
     ext: '.epub',
-    desc: '标准 EPUB 3 打包章节与手账',
+    desc: '标准 EPUB 3 打包章节与图表',
     icon: BookOpen,
   },
   {
@@ -98,7 +103,7 @@ const FORMAT_OPTIONS: {
     id: 'html',
     label: 'HTML 网页手账',
     ext: '.html',
-    desc: '独立单文件暖调排版网页',
+    desc: '独立单文件暖调排版与矢量图',
     icon: Layers,
   },
   {
@@ -130,10 +135,11 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
   const [statusToast, setStatusToast] = useState<string | null>(null);
   const [pdfPreviewPageIdx, setPdfPreviewPageIdx] = useState<number>(0);
   const [pdfZoomFit, setPdfZoomFit] = useState<boolean>(true);
+  const [mermaidReadyTick, setMermaidReadyTick] = useState<number>(0);
 
   useEffect(() => {
     if (isOpen) {
-      warmUpCjkPdfFont();
+      warmUpCjkPdfFont(initialConfig?.fontStyle || config.fontStyle || 'serif');
       setSelectedBookId(book.id);
       setConfig((prev) => ({
         ...prev,
@@ -144,12 +150,34 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
     }
   }, [isOpen, book.id, initialFormat, initialConfig]);
 
+  useEffect(() => {
+    if (isOpen && config.format === 'pdf') {
+      warmUpCjkPdfFont(config.fontStyle || 'serif');
+    }
+  }, [isOpen, config.format, config.fontStyle]);
+
   const activeBook = useMemo(() => {
     if (allBooks && allBooks.length > 0) {
       return allBooks.find((b) => b.id === selectedBookId) || book;
     }
     return book;
   }, [allBooks, selectedBookId, book]);
+
+  // Pre-warm all Mermaid diagrams in the active book whenever modal opens or theme changes
+  useEffect(() => {
+    if (!isOpen || !activeBook?.content) return;
+    let cancelled = false;
+    warmUpMermaidDiagramsForContent(activeBook.content, config.themeStyle)
+      .then(() => {
+        if (!cancelled) {
+          setMermaidReadyTick((t) => t + 1);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, activeBook.id, activeBook.content, config.themeStyle]);
 
   const bookAnnotations = useMemo(
     () => annotations.filter((a) => a.bookId === activeBook.id),
@@ -177,13 +205,13 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
     [activeBook, config.selectedChapterIds]
   );
 
-  // Live jsPDF multi-page A4 vector preview
+  // Live jsPDF multi-page A4 vector preview (renders 100% of book pages to match exported PDF)
   const jsPdfPreview = useMemo(() => {
     if (!isOpen || config.format !== 'pdf') {
       return null;
     }
-    return renderJsPdfPages(activeBook, bookAnnotations, dailyStats, config, 18);
-  }, [isOpen, config, activeBook, bookAnnotations, dailyStats]);
+    return renderJsPdfPages(activeBook, bookAnnotations, dailyStats, config, Infinity);
+  }, [isOpen, config, activeBook, bookAnnotations, dailyStats, mermaidReadyTick]);
 
   useEffect(() => {
     if (jsPdfPreview && pdfPreviewPageIdx >= jsPdfPreview.totalPages) {
@@ -207,10 +235,16 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
       return buildStructuredJsonExport([activeBook], bookAnnotations, dailyStats, syncedConfig);
     }
     if (config.format === 'txt') {
-      return buildTxtExport(activeBook, bookAnnotations, config.includeFullText);
+      return buildTxtExport(activeBook, bookAnnotations, {
+        includeFullText: config.includeFullText,
+        includeNotes: syncedConfig.includeNotes,
+        includeExcerpts: syncedConfig.includeExcerpts,
+        includeOutline: syncedConfig.includeOutline,
+        selectedChapterIds: syncedConfig.selectedChapterIds,
+      });
     }
     return buildStyledHtmlDocument(activeBook, bookAnnotations, dailyStats, syncedConfig);
-  }, [isOpen, config, activeBook, bookAnnotations, dailyStats]);
+  }, [isOpen, config, activeBook, bookAnnotations, dailyStats, mermaidReadyTick]);
 
   if (!isOpen) return null;
 
@@ -242,14 +276,14 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
     };
 
     if (config.format === 'pdf') {
-      triggerNotice('正在生成矢量文字 PDF...');
+      triggerNotice('正在渲染全书 Mermaid 图表并生成矢量 PDF...');
       const result = await exportBookWithJsPdf(
         activeBook,
         bookAnnotations,
         dailyStats,
         syncedConfig
       );
-      triggerNotice(`已导出 ${result.totalPages} 页 A4 矢量文字 PDF 文档`);
+      triggerNotice(`已完整导出 ${result.totalPages} 页 A4 矢量 PDF（含全部图表）`);
       return;
     }
 
@@ -261,9 +295,11 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
     }
 
     if (config.format === 'epub') {
+      triggerNotice('正在渲染 Mermaid 矢量图表并打包 EPUB...');
+      await warmUpMermaidDiagramsForContent(activeBook.content, syncedConfig.themeStyle);
       const epubBlob = buildEpubBlob(activeBook, bookAnnotations, dailyStats, syncedConfig);
       triggerBlobDownload(`${safeTitle}.epub`, epubBlob);
-      triggerNotice('已打包导出标准 EPUB (.epub) 电子书');
+      triggerNotice('已打包导出标准 EPUB (.epub) 电子书（含图表与表格）');
       return;
     }
 
@@ -282,28 +318,43 @@ export const ExportStudioModal: React.FC<ExportStudioModalProps> = ({
     }
 
     if (config.format === 'html') {
+      await warmUpMermaidDiagramsForContent(activeBook.content, syncedConfig.themeStyle);
       const html = buildStyledHtmlDocument(activeBook, bookAnnotations, dailyStats, syncedConfig);
       triggerFileDownload(`${safeTitle}-典藏手账.html`, html, 'text/html');
-      triggerNotice('已导出 HTML 典藏网页手账');
+      triggerNotice('已导出 HTML 典藏网页手账（含内嵌 SVG 图表）');
       return;
     }
 
     if (config.format === 'txt') {
-      const txt = buildTxtExport(activeBook, bookAnnotations, config.includeFullText);
+      const txt = buildTxtExport(activeBook, bookAnnotations, {
+        includeFullText: config.includeFullText,
+        includeNotes: syncedConfig.includeNotes,
+        includeExcerpts: syncedConfig.includeExcerpts,
+        includeOutline: syncedConfig.includeOutline,
+        selectedChapterIds: syncedConfig.selectedChapterIds,
+      });
       triggerFileDownload(`${safeTitle}-读书笔记.txt`, txt, 'text/plain');
       triggerNotice('已导出 TXT 读书笔记');
     }
   };
 
-  const handleNativePrintPdf = () => {
+  const handleNativePrintPdf = async () => {
     const syncedConfig: ExportConfig = {
       ...config,
       includeAnnotations: Boolean(config.includeNotes || config.includeExcerpts),
     };
+    triggerNotice('正在准备 100% 图表与全书矢量打印排版...');
+    await warmUpMermaidDiagramsForContent(activeBook.content, syncedConfig.themeStyle);
     if (config.format === 'pdf') {
-      const fullResult = renderJsPdfPages(activeBook, bookAnnotations, dailyStats, syncedConfig, 120);
+      const fullResult = renderJsPdfPages(
+        activeBook,
+        bookAnnotations,
+        dailyStats,
+        syncedConfig,
+        Infinity
+      );
       printDocumentViaHiddenIframe(fullResult.vectorPrintHtml);
-      triggerNotice('已唤起无页眉 A4 矢量文字打印视图');
+      triggerNotice(`已唤起全书 ${fullResult.totalPages} 页 A4 矢量打印视图`);
       return;
     }
     const html = buildStyledHtmlDocument(activeBook, bookAnnotations, dailyStats, syncedConfig);

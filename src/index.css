@@ -190,10 +190,9 @@ html[data-theme="eink"] {
   animation: einkFlash 220ms steps(3, end);
 }
 
-/* Subtle paper grain background texture */
+/* Smooth paper background texture (dotted grain removed) */
 .paper-grain {
-  background-image: radial-gradient(rgba(122, 99, 82, 0.055) 1px, transparent 0);
-  background-size: 20px 20px;
+  background-image: none;
 }
 
 /* Custom subtle scrollbars */
@@ -373,6 +372,79 @@ html[data-theme="eink"] {
 }
 .reader-md-td:last-child {
   border-right: none;
+}
+
+/* Full-width text layout & anti-cliff paragraph wrapping for reader columns */
+[data-reader-column="true"] {
+  width: 100%;
+}
+
+[data-reader-column="true"] p {
+  text-align: justify;
+  text-justify: inter-ideograph;
+  line-break: strict;
+  hanging-punctuation: allow-end;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+/* Precision Inline Highlight Marks (<mark class="reader-inline-mark ...">) */
+.reader-inline-mark {
+  color: inherit;
+  border-radius: 3px;
+  padding: 1px 0;
+  cursor: pointer;
+  transition: filter 150ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 150ms cubic-bezier(0.16, 1, 0.3, 1);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.reader-inline-mark:hover {
+  filter: brightness(0.95);
+}
+
+.reader-inline-mark-amber {
+  background-color: var(--highlight-amber);
+  border-bottom: 1.5px solid rgba(217, 119, 36, 0.65);
+}
+
+.reader-inline-mark-caramel {
+  background-color: var(--highlight-caramel);
+  border-bottom: 1.5px solid rgba(180, 83, 42, 0.65);
+}
+
+.reader-inline-mark-sage {
+  background-color: var(--highlight-sage);
+  border-bottom: 1.5px solid rgba(92, 128, 96, 0.65);
+}
+
+.reader-inline-mark-has-note {
+  border-bottom-style: wavy;
+}
+
+/* Full-Text Search Match Highlight */
+.reader-search-mark {
+  background-color: rgba(217, 119, 36, 0.38);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 2px;
+  box-shadow: 0 0 0 1px rgba(180, 83, 42, 0.45);
+}
+
+/* Subtle Page-Turn Settling Micro-Animation */
+@keyframes pageTurnSettle {
+  0% {
+    opacity: 0.72;
+    transform: translate3d(0, 2px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.reader-page-settle {
+  animation: pageTurnSettle 150ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 

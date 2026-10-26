@@ -22,6 +22,7 @@ const mermaidSvgCache = new Map<
  * labels wrap and size accurately in dynamic containers.
  */
 export function configureMermaidEngine(theme: ReaderTheme = 'cafe', containerWidth = 560): void {
+  if (typeof window === 'undefined') return;
   const safeContainerW = Math.max(180, containerWidth || 560);
   const isMobile = safeContainerW < 540;
   // Calculate adaptive wrapping width based on dynamic container width
@@ -164,12 +165,12 @@ export function sanitizeMermaidCode(rawCode: string): string {
     .replace(/```\s*$/, '')
     .trim();
 
-  // 1. Auto-quote node labels with special characters (&, #, +, -, :, etc.) if not already quoted
+  // 1. Auto-quote node labels with special characters (&, #, +, -, :, ;, etc.) if not already quoted
   cleaned = cleaned.replace(
-    /(\b[A-Za-z0-9_-]+)(\[|\(|\(\[|\[\(|\{\{)([^"\n\]\)\}>]+)(\]|\)|\)\]|\)\]|\}\})/g,
+    /(\b[A-Za-z0-9_-]+)(\[|\(|\(\[|\[\(|\{\{)([^"\n\]\)\}>]+)(\]|\)|\)\]|\}\})/g,
     (match, id, open, text, close) => {
       const trimmed = text.trim();
-      if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) {
+      if (/[&+#:;/]/.test(trimmed) && (!trimmed.startsWith('"') || !trimmed.endsWith('"'))) {
         const escaped = trimmed.replace(/"/g, '\\"');
         return `${id}${open}"${escaped}"${close}`;
       }
@@ -229,7 +230,7 @@ export async function renderMermaidDiagram(
 
   const sanitized = sanitizeMermaidCode(rawCode);
   const cleanCode = normalizeMermaidDirectionToTD(sanitized, shouldForceTD);
-  const cacheKey = `v3:::${theme}:::${shouldForceTD ? 'TD' : 'AUTO'}:::${cleanCode}`;
+  const cacheKey = `v4:::${theme}:::${shouldForceTD ? 'TD' : 'AUTO'}:::${cleanCode}`;
 
   const cached = mermaidSvgCache.get(cacheKey);
   if (cached) {
@@ -242,48 +243,35 @@ export async function renderMermaidDiagram(
     if (existing) return existing;
 
     configureMermaidEngine(theme, safeContainerWidth);
-    const uniqueId = `mermaid-svg-node-${++mermaidRenderSeq}`;
+    const uniqueId = `mermaid_svg_${Date.now()}_${++mermaidRenderSeq}`;
 
-    let measureHost: HTMLDivElement | null = null;
-    if (typeof document !== 'undefined') {
-      measureHost = document.createElement('div');
-      measureHost.className = 'md-mermaid-svg-host';
-      measureHost.style.cssText = `
-        position: fixed;
-        left: -9999px;
-        top: 0;
-        width: ${safeContainerWidth}px;
-        max-width: 100vw;
-        visibility: hidden;
-        pointer-events: none;
-        font-family: "PingFang SC", "Microsoft YaHei", "Plus Jakarta Sans", sans-serif;
-        font-size: 13px;
-      `;
-      document.body.appendChild(measureHost);
+    let renderResult: { svg: string; bindFunctions?: (element: Element) => void };
+    try {
+      renderResult = await mermaid.render(uniqueId, cleanCode);
+    } catch (errPrimary) {
+      // If sanitized/cleanCode fails, fallback to rendering raw code directly
+      try {
+        const fallbackId = `mermaid_fb_${Date.now()}_${++mermaidRenderSeq}`;
+        renderResult = await mermaid.render(fallbackId, rawCode.trim());
+      } catch {
+        throw errPrimary;
+      }
     }
 
-    try {
-      const renderResult = await mermaid.render(
-        uniqueId,
-        cleanCode,
-        measureHost || undefined
-      );
-      const rawSvg = renderResult.svg;
+    const rawSvg = renderResult.svg;
+    let naturalWidth = safeContainerWidth;
+    let naturalHeight = 220;
+    let finalSvg = rawSvg;
 
-      let naturalWidth = safeContainerWidth;
-      let naturalHeight = 220;
-      let finalSvg = rawSvg;
-
-      if (measureHost) {
-        measureHost.innerHTML = rawSvg;
-        const svgEl = measureHost.querySelector('svg');
+    if (typeof DOMParser !== 'undefined') {
+      try {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(rawSvg, 'image/svg+xml');
+        const svgEl = doc.querySelector('svg');
         if (svgEl) {
           const vbAttr = svgEl.getAttribute('viewBox');
           if (vbAttr) {
-            const parts = vbAttr
-              .trim()
-              .split(/[\s,]+/)
-              .map(Number);
+            const parts = vbAttr.trim().split(/[\s,]+/).map(Number);
             if (parts.length === 4 && !parts.some(isNaN) && parts[2] > 0 && parts[3] > 0) {
               naturalWidth = Math.round(parts[2]);
               naturalHeight = Math.round(parts[3]);
@@ -313,22 +301,20 @@ export async function renderMermaidDiagram(
           // and horizontal scroll panning without forced clipping, especially in narrow reader windows
           finalSvg = `<div class="mermaid-interactive-viewport" style="width: 100%; max-width: 100%; overflow-x: auto; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y pinch-zoom; display: flex; justify-content: center; align-items: center; position: relative;">${svgEl.outerHTML}</div>`;
         }
-      } else {
+      } catch {
         finalSvg = `<div class="mermaid-interactive-viewport" style="width: 100%; max-width: 100%; overflow-x: auto; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y pinch-zoom; display: flex; justify-content: center; align-items: center; position: relative;">${rawSvg}</div>`;
       }
-
-      const res = {
-        svg: finalSvg,
-        naturalWidth: Math.max(180, naturalWidth),
-        naturalHeight: Math.max(60, naturalHeight),
-      };
-      mermaidSvgCache.set(cacheKey, res);
-      return res;
-    } finally {
-      if (measureHost && measureHost.parentNode) {
-        measureHost.parentNode.removeChild(measureHost);
-      }
+    } else {
+      finalSvg = `<div class="mermaid-interactive-viewport" style="width: 100%; max-width: 100%; overflow-x: auto; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y pinch-zoom; display: flex; justify-content: center; align-items: center; position: relative;">${rawSvg}</div>`;
     }
+
+    const res = {
+      svg: finalSvg,
+      naturalWidth: Math.max(180, naturalWidth),
+      naturalHeight: Math.max(60, naturalHeight),
+    };
+    mermaidSvgCache.set(cacheKey, res);
+    return res;
   });
 
   mermaidRenderQueue = resultPromise.catch(() => {});
@@ -360,6 +346,586 @@ export interface ParsedMarkdownBlock {
   startOffset: number;
   endOffset: number;
   isContinuation?: boolean;
+  start?: number;
+}
+
+export interface ExportedMermaidDiagram {
+  code: string;
+  svg: string;
+  svgDataUrl: string;
+  pngDataUrl: string;
+  width: number;
+  height: number;
+}
+
+const exportMermaidCache = new Map<string, ExportedMermaidDiagram>();
+
+function getExportPaletteForTheme(themeStyle = 'parchment') {
+  if (themeStyle === 'espresso' || themeStyle === 'night' || themeStyle === 'candlelight') {
+    return {
+      bg: '#211A15',
+      surface: '#2C221C',
+      nodeFill: '#352820',
+      text: '#EAE0D5',
+      muted: '#B8A693',
+      accent: '#D97724',
+      border: '#594436',
+      line: '#C4B4A2',
+    };
+  }
+  if (themeStyle === 'eink') {
+    return {
+      bg: '#F7F7F7',
+      surface: '#ECECEC',
+      nodeFill: '#E2E2E2',
+      text: '#141414',
+      muted: '#4A4A4A',
+      accent: '#222222',
+      border: '#333333',
+      line: '#222222',
+    };
+  }
+  if (themeStyle === 'caramel' || themeStyle === 'sandalwood') {
+    return {
+      bg: '#F7EEDF',
+      surface: '#EFE3CE',
+      nodeFill: '#E5D4B7',
+      text: '#261810',
+      muted: '#543B2B',
+      accent: '#9E3E16',
+      border: '#B87A56',
+      line: '#7D604D',
+    };
+  }
+  return {
+    bg: '#FBF7F0',
+    surface: '#F5EFE4',
+    nodeFill: '#EFE6D5',
+    text: '#2C1E16',
+    muted: '#5C4738',
+    accent: '#B4532A',
+    border: '#C79272',
+    line: '#7A6352',
+  };
+}
+
+function configureMermaidForPureSvgExport(themeStyle = 'parchment'): void {
+  if (typeof window === 'undefined') return;
+  const pal = getExportPaletteForTheme(themeStyle);
+  const cjkFontStack =
+    '"PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Plus Jakarta Sans", sans-serif';
+
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: 'loose',
+    theme: themeStyle === 'espresso' ? 'dark' : 'base',
+    htmlLabels: false,
+    flowchart: {
+      htmlLabels: false,
+      wrappingWidth: 210,
+      padding: 14,
+      nodeSpacing: 42,
+      rankSpacing: 52,
+      curve: 'basis',
+      useMaxWidth: false,
+    },
+    sequence: {
+      useMaxWidth: false,
+      mirrorActors: false,
+    },
+    gantt: {
+      useMaxWidth: false,
+    },
+    pie: {
+      useMaxWidth: false,
+    },
+    class: {
+      htmlLabels: false,
+      useMaxWidth: false,
+    },
+    state: {
+      useMaxWidth: false,
+    },
+    themeVariables: {
+      background: pal.bg,
+      primaryColor: pal.nodeFill,
+      primaryTextColor: pal.text,
+      primaryBorderColor: pal.accent,
+      lineColor: pal.line,
+      secondaryColor: pal.surface,
+      tertiaryColor: pal.bg,
+      mainBkg: pal.nodeFill,
+      nodeBorder: pal.accent,
+      clusterBkg: pal.surface,
+      clusterBorder: pal.border,
+      titleColor: pal.text,
+      edgeLabelBackground: pal.bg,
+      fontFamily: cjkFontStack,
+      fontSize: '13px',
+    },
+  });
+}
+
+/**
+ * Converts any `<foreignObject>` inside a Mermaid SVG into pure native SVG `<text>`/`<tspan>` nodes
+ * and ensures explicit numeric `width`, `height`, and `viewBox` attributes so the SVG renders 100%
+ * inside `<img>`, `<canvas>` (for jsPDF PNG embedding), print sheets, HTML, and EPUB.
+ */
+function sanitizeMermaidSvgToPureVector(
+  rawSvg: string,
+  themeStyle = 'parchment'
+): { pureSvg: string; width: number; height: number } {
+  const pal = getExportPaletteForTheme(themeStyle);
+  let width = 560;
+  let height = 260;
+
+  if (typeof DOMParser === 'undefined') {
+    return { pureSvg: rawSvg, width, height };
+  }
+
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(rawSvg, 'image/svg+xml');
+    const svgEl = doc.querySelector('svg');
+    if (!svgEl) {
+      return { pureSvg: rawSvg, width, height };
+    }
+
+    let minX = 0;
+    let minY = 0;
+    const vbAttr = svgEl.getAttribute('viewBox');
+    if (vbAttr) {
+      const parts = vbAttr
+        .trim()
+        .split(/[\s,]+/)
+        .map(Number);
+      if (parts.length === 4 && !parts.some(isNaN) && parts[2] > 0 && parts[3] > 0) {
+        minX = parts[0];
+        minY = parts[1];
+        width = Math.max(160, Math.ceil(parts[2]));
+        height = Math.max(80, Math.ceil(parts[3]));
+      }
+    } else {
+      const wAttr = parseFloat(svgEl.getAttribute('width') || '560');
+      const hAttr = parseFloat(svgEl.getAttribute('height') || '260');
+      if (!isNaN(wAttr) && wAttr > 0) width = Math.max(160, Math.ceil(wAttr));
+      if (!isNaN(hAttr) && hAttr > 0) height = Math.max(80, Math.ceil(hAttr));
+    }
+
+    // Add breathing padding around viewBox so borders/labels never clip
+    const pad = 12;
+    const finalVb = `${minX - pad} ${minY - pad} ${width + pad * 2} ${height + pad * 2}`;
+    width += pad * 2;
+    height += pad * 2;
+
+    svgEl.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    svgEl.setAttribute('viewBox', finalVb);
+    svgEl.setAttribute('width', String(width));
+    svgEl.setAttribute('height', String(height));
+    svgEl.setAttribute(
+      'style',
+      `background-color:${pal.bg};max-width:100%;height:auto;display:block;margin:0 auto;`
+    );
+
+    // Replace any remaining <foreignObject> nodes with native SVG <text>/<tspan> elements
+    svgEl.querySelectorAll('foreignObject').forEach((fo) => {
+      const rawLabel = (fo.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!rawLabel) {
+        fo.remove();
+        return;
+      }
+      const fx = parseFloat(fo.getAttribute('x') || '0') || 0;
+      const fy = parseFloat(fo.getAttribute('y') || '0') || 0;
+      const rawW = parseFloat(fo.getAttribute('width') || '0');
+      const rawH = parseFloat(fo.getAttribute('height') || '0');
+      // Only offset by fw/2 if width/height are genuinely positive; if 0, parent <g> is already centered at (0,0)
+      const cx = rawW > 2 ? fx + rawW / 2 : fx;
+      const cy = rawH > 2 ? fy + rawH / 2 : fy;
+      const wrapW = rawW > 40 ? rawW : 180;
+
+      const textEl = doc.createElementNS('http://www.w3.org/2000/svg', 'text');
+      textEl.setAttribute('x', String(cx));
+      textEl.setAttribute('y', String(cy));
+      textEl.setAttribute('text-anchor', 'middle');
+      textEl.setAttribute('dominant-baseline', 'central');
+      textEl.setAttribute('fill', pal.text);
+      textEl.setAttribute('font-size', '12.5');
+      textEl.setAttribute('font-weight', '600');
+      textEl.setAttribute(
+        'font-family',
+        "'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif"
+      );
+
+      const maxCharsPerLine = Math.max(10, Math.floor(wrapW / 13));
+      const lines: string[] = [];
+      for (let idx = 0; idx < rawLabel.length; idx += maxCharsPerLine) {
+        lines.push(rawLabel.slice(idx, idx + maxCharsPerLine));
+      }
+
+      if (lines.length <= 1) {
+        textEl.textContent = rawLabel;
+      } else {
+        const lineHeight = 15;
+        const startOffset = -((lines.length - 1) * lineHeight) / 2;
+        lines.forEach((ln, idx) => {
+          const tspan = doc.createElementNS('http://www.w3.org/2000/svg', 'tspan');
+          tspan.setAttribute('x', String(cx));
+          tspan.setAttribute('dy', idx === 0 ? String(startOffset) : String(lineHeight));
+          tspan.textContent = ln;
+          textEl.appendChild(tspan);
+        });
+      }
+
+      fo.parentNode?.replaceChild(textEl, fo);
+    });
+
+    // Insert background rect as the first visual child so transparent areas match the theme paper
+    const bgRect = doc.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    bgRect.setAttribute('x', String(minX - pad));
+    bgRect.setAttribute('y', String(minY - pad));
+    bgRect.setAttribute('width', String(width));
+    bgRect.setAttribute('height', String(height));
+    bgRect.setAttribute('rx', '8');
+    bgRect.setAttribute('fill', pal.bg);
+    svgEl.insertBefore(bgRect, svgEl.firstChild);
+
+    const serializer = new XMLSerializer();
+    const pureSvg = serializer.serializeToString(svgEl);
+    return { pureSvg, width, height };
+  } catch {
+    return { pureSvg: rawSvg, width, height };
+  }
+}
+
+/**
+ * Deterministic pure-SVG diagram synthesizer used as an instant synchronous fallback
+ * or if a custom Mermaid snippet contains non-standard syntax, guaranteeing 100% diagram output.
+ */
+function buildSynthesizedMermaidDiagram(
+  rawCode: string,
+  themeStyle = 'parchment'
+): ExportedMermaidDiagram {
+  const pal = getExportPaletteForTheme(themeStyle);
+  const cleaned = rawCode
+    .replace(/^```(?:mermaid|mmd|flowchart|graph)?\s*/i, '')
+    .replace(/```\s*$/, '')
+    .trim();
+
+  const rawLines = cleaned
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('%%'));
+
+  // Extract nodes & relationships for visual flowchart/diagram layout
+  const nodeMap = new Map<string, string>();
+  const edges: { from: string; to: string; label?: string }[] = [];
+  const subgraphs: { title: string; nodes: string[] }[] = [];
+  let activeSubgraph: { title: string; nodes: string[] } | null = null;
+
+  const registerNode = (token: string): string => {
+    const t = token.trim();
+    const match = t.match(
+      /^([A-Za-z0-9_\u4e00-\u9fa5-]+)\s*(?:\[\s*"?([^"\]]+)"?\s*\]|\(\s*"?([^"\)]+)"?\s*\)|\{\s*"?([^"\}]+)"?\s*\})?$/
+    );
+    if (match) {
+      const id = match[1];
+      const label = (match[2] || match[3] || match[4] || id).trim();
+      if (!nodeMap.has(id) || nodeMap.get(id) === id) {
+        nodeMap.set(id, label);
+      }
+      if (activeSubgraph && !activeSubgraph.nodes.includes(id)) {
+        activeSubgraph.nodes.push(id);
+      }
+      return id;
+    }
+    const cleanId = t.replace(/["\[\](){}]/g, '').trim() || `node_${nodeMap.size + 1}`;
+    if (!nodeMap.has(cleanId)) {
+      nodeMap.set(cleanId, cleanId);
+    }
+    if (activeSubgraph && !activeSubgraph.nodes.includes(cleanId)) {
+      activeSubgraph.nodes.push(cleanId);
+    }
+    return cleanId;
+  };
+
+  for (const line of rawLines) {
+    if (/^(?:flowchart|graph|sequenceDiagram|mindmap|gantt|pie|classDiagram|stateDiagram|erDiagram|direction)\b/i.test(line)) {
+      continue;
+    }
+    const sgMatch = line.match(/^subgraph\s+(?:[A-Za-z0-9_]+\s*\[\s*"?([^"\]]+)"?\s*\]|(.+))$/i);
+    if (sgMatch) {
+      const title = (sgMatch[1] || sgMatch[2] || '模块分组').replace(/"/g, '').trim();
+      activeSubgraph = { title, nodes: [] };
+      subgraphs.push(activeSubgraph);
+      continue;
+    }
+    if (/^end\b/i.test(line)) {
+      activeSubgraph = null;
+      continue;
+    }
+
+    // Check for edge connections: A --> B, A -->|label| B, A --- B, A ->> B
+    const edgeMatch = line.match(
+      /^(.+?)\s*(?:-->|---|-\.->|==>|-->>|->>)\s*(?:\|([^|]+)\|)?\s*(.+)$/
+    );
+    if (edgeMatch) {
+      const leftId = registerNode(edgeMatch[1]);
+      const edgeLabel = edgeMatch[2]?.trim();
+      const rightTargets = edgeMatch[3].split('&').map((s) => s.trim()).filter(Boolean);
+      for (const rt of rightTargets) {
+        const rightId = registerNode(rt);
+        edges.push({ from: leftId, to: rightId, label: edgeLabel });
+      }
+      continue;
+    }
+
+    // Standalone node or item line
+    registerNode(line);
+  }
+
+  const allNodes = Array.from(nodeMap.entries());
+  if (allNodes.length === 0) {
+    allNodes.push(['root', cleaned.slice(0, 48) || 'Mermaid 结构图']);
+  }
+
+  const cols = allNodes.length <= 4 ? Math.min(2, allNodes.length) : 3;
+  const rows = Math.ceil(allNodes.length / cols);
+  const width = 540;
+  const nodeW = cols === 1 ? 260 : cols === 2 ? 210 : 148;
+  const nodeH = 42;
+  const gapX = cols === 1 ? 0 : (width - 56 - cols * nodeW) / Math.max(1, cols - 1);
+  const gapY = 34;
+  const topPad = subgraphs.length > 0 ? 44 : 24;
+  const height = Math.max(120, topPad + rows * nodeH + Math.max(0, rows - 1) * gapY + 28);
+
+  const coords = new Map<string, { x: number; y: number; cx: number; cy: number }>();
+  const svgParts: string[] = [
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="background-color:${pal.bg};max-width:100%;height:auto;display:block;margin:0 auto;">`,
+    `<defs><marker id="m_arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="${pal.line}"/></marker></defs>`,
+    `<rect x="0" y="0" width="${width}" height="${height}" rx="8" fill="${pal.bg}" stroke="${pal.border}" stroke-width="1"/>`,
+  ];
+
+  if (subgraphs.length > 0) {
+    const sgTitles = subgraphs.map((s) => s.title).join(' · ');
+    svgParts.push(
+      `<text x="20" y="24" fill="${pal.accent}" font-size="11" font-weight="700" font-family="'PingFang SC', 'Microsoft YaHei', sans-serif">${escapeXml(
+        sgTitles.slice(0, 52)
+      )}</text>`
+    );
+  }
+
+  allNodes.forEach(([id], idx) => {
+    const r = Math.floor(idx / cols);
+    const c = idx % cols;
+    const x = cols === 1 ? (width - nodeW) / 2 : 28 + c * (nodeW + gapX);
+    const y = topPad + r * (nodeH + gapY);
+    coords.set(id, { x, y, cx: x + nodeW / 2, cy: y + nodeH / 2 });
+  });
+
+  // Draw edges
+  for (const e of edges) {
+    const fromPos = coords.get(e.from);
+    const toPos = coords.get(e.to);
+    if (!fromPos || !toPos) continue;
+    const x1 = fromPos.cx;
+    const y1 = fromPos.cy <= toPos.cy ? fromPos.y + nodeH : fromPos.y;
+    const x2 = toPos.cx;
+    const y2 = fromPos.cy <= toPos.cy ? toPos.y : toPos.y + nodeH;
+    svgParts.push(
+      `<path d="M ${x1} ${y1} C ${x1} ${(y1 + y2) / 2}, ${x2} ${(y1 + y2) / 2}, ${x2} ${y2}" fill="none" stroke="${pal.line}" stroke-width="1.4" marker-end="url(#m_arrow)"/>`
+    );
+  }
+
+  // Draw nodes
+  allNodes.forEach(([id, label]) => {
+    const pos = coords.get(id)!;
+    const displayLabel = label.length > 22 ? label.slice(0, 21) + '…' : label;
+    svgParts.push(
+      `<rect x="${pos.x}" y="${pos.y}" width="${nodeW}" height="${nodeH}" rx="7" fill="${pal.nodeFill}" stroke="${pal.accent}" stroke-width="1.3"/>`,
+      `<text x="${pos.cx}" y="${pos.cy}" text-anchor="middle" dominant-baseline="central" fill="${pal.text}" font-size="11.5" font-weight="600" font-family="'PingFang SC', 'Microsoft YaHei', sans-serif">${escapeXml(
+        displayLabel
+      )}</text>`
+    );
+  });
+
+  svgParts.push('</svg>');
+  const pureSvg = svgParts.join('');
+  const svgDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(pureSvg)}`;
+  return {
+    code: rawCode.trim(),
+    svg: pureSvg,
+    svgDataUrl,
+    pngDataUrl: '',
+    width,
+    height,
+  };
+}
+
+/**
+ * Rasterizes a pure native SVG string onto a high-DPI (3.0x Ultra-Retina) offscreen canvas
+ * and returns a PNG data URL (`data:image/png;base64,...`) suitable for `jsPDF.addImage`.
+ */
+export async function rasterizePureSvgToPngDataUrl(
+  pureSvg: string,
+  width: number,
+  height: number,
+  bgColor: string
+): Promise<string> {
+  if (typeof document === 'undefined' || typeof Image === 'undefined') return '';
+  const svgDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(pureSvg)}`;
+
+  return new Promise<string>((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    const timeout = setTimeout(() => resolve(''), 4000);
+
+    img.onload = () => {
+      clearTimeout(timeout);
+      try {
+        const scale = 3.0;
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve('');
+          return;
+        }
+        ctx.fillStyle = bgColor;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/png'));
+      } catch {
+        resolve('');
+      }
+    };
+    img.onerror = () => {
+      clearTimeout(timeout);
+      resolve('');
+    };
+    img.src = svgDataUrl;
+  });
+}
+
+function getMermaidExportCacheKey(rawCode: string, themeStyle = 'parchment'): string {
+  const sanitized = sanitizeMermaidCode(rawCode);
+  return `exp_v3:::${themeStyle}:::${sanitized}`;
+}
+
+/**
+ * Synchronously retrieves a pre-rendered Mermaid diagram for PDF/HTML/EPUB export.
+ * Checks exportMermaidCache first, then checks the Reader's live mermaidSvgCache,
+ * and falls back to the deterministic pure-SVG diagram synthesizer so zero blocks are omitted.
+ */
+export function getExportedMermaidDiagramSync(
+  rawCode: string,
+  themeStyle = 'parchment'
+): ExportedMermaidDiagram {
+  const key = getMermaidExportCacheKey(rawCode, themeStyle);
+  const cached = exportMermaidCache.get(key);
+  if (cached) return cached;
+
+  const sanitized = sanitizeMermaidCode(rawCode);
+  for (const [liveKey, liveVal] of mermaidSvgCache.entries()) {
+    if (liveKey.endsWith(`:::${sanitized}`) && liveVal.svg) {
+      const converted = sanitizeMermaidSvgToPureVector(liveVal.svg, themeStyle);
+      const svgDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(converted.pureSvg)}`;
+      return {
+        code: rawCode.trim(),
+        svg: converted.pureSvg,
+        svgDataUrl,
+        pngDataUrl: '',
+        width: converted.width,
+        height: converted.height,
+      };
+    }
+  }
+
+  return buildSynthesizedMermaidDiagram(rawCode, themeStyle);
+}
+
+/**
+ * Pre-renders a single Mermaid diagram for export (pure native SVG + 3.0x PNG DataURL for jsPDF).
+ */
+export async function renderMermaidForExport(
+  rawCode: string,
+  themeStyle = 'parchment'
+): Promise<ExportedMermaidDiagram> {
+  const key = getMermaidExportCacheKey(rawCode, themeStyle);
+  const cached = exportMermaidCache.get(key);
+  if (cached && cached.pngDataUrl) {
+    return cached;
+  }
+
+  const pal = getExportPaletteForTheme(themeStyle);
+  const sanitized = sanitizeMermaidCode(rawCode);
+  // If a horizontal flowchart has many edges (> 5), normalize to TD so it fits cleanly on an A4 column
+  const edgeCount = (sanitized.match(/-->|---|-\.->|==>/g) || []).length;
+  const a4AdaptedCode =
+    edgeCount > 5 ? normalizeMermaidDirectionToTD(sanitized, true) : sanitized;
+
+  const resultPromise = mermaidRenderQueue.then(async () => {
+    const existing = exportMermaidCache.get(key);
+    if (existing && existing.pngDataUrl) return existing;
+
+    let pureSvg = '';
+    let width = 560;
+    let height = 260;
+
+    try {
+      configureMermaidForPureSvgExport(themeStyle);
+      const uniqueId = `mermaid_exp_${Date.now()}_${++mermaidRenderSeq}`;
+      let renderRes: { svg: string };
+      try {
+        renderRes = await mermaid.render(uniqueId, a4AdaptedCode);
+      } catch {
+        const fbId = `mermaid_exp_fb_${Date.now()}_${++mermaidRenderSeq}`;
+        renderRes = await mermaid.render(fbId, rawCode.trim());
+      }
+      const converted = sanitizeMermaidSvgToPureVector(renderRes.svg, themeStyle);
+      pureSvg = converted.pureSvg;
+      width = converted.width;
+      height = converted.height;
+    } catch {
+      const synth = buildSynthesizedMermaidDiagram(rawCode, themeStyle);
+      pureSvg = synth.svg;
+      width = synth.width;
+      height = synth.height;
+    }
+
+    const svgDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(pureSvg)}`;
+    const pngDataUrl = await rasterizePureSvgToPngDataUrl(pureSvg, width, height, pal.bg);
+
+    const exported: ExportedMermaidDiagram = {
+      code: rawCode.trim(),
+      svg: pureSvg,
+      svgDataUrl,
+      pngDataUrl,
+      width,
+      height,
+    };
+    exportMermaidCache.set(key, exported);
+    return exported;
+  });
+
+  mermaidRenderQueue = resultPromise.catch(() => {});
+  return resultPromise;
+}
+
+/**
+ * Scans a Markdown/TXT document for all Mermaid diagrams (both fenced and unfenced)
+ * and warms up their pure-SVG + high-DPI PNG representations in the export cache.
+ */
+export async function warmUpMermaidDiagramsForContent(
+  content: string,
+  themeStyle = 'parchment'
+): Promise<void> {
+  if (!content) return;
+  const blocks = parseDocumentWithMarkdownIt(content);
+  const mermaidBlocks = blocks.filter((b) => b.type === 'mermaid' && b.text.trim());
+  for (const block of mermaidBlocks) {
+    await renderMermaidForExport(block.text, themeStyle);
+  }
 }
 
 /**
@@ -477,12 +1043,26 @@ export function renderInlineMarkdown(text: string): string {
 }
 
 /**
- * Renders full Markdown document to HTML via markdown-it (including tables and Mermaid containers).
+ * Renders full Markdown document to HTML via markdown-it (including tables and inline rendered Mermaid SVGs).
  */
-export function renderFullMarkdownToHtml(markdown: string): string {
+export function renderFullMarkdownToHtml(markdown: string, themeStyle = 'parchment'): string {
   if (!markdown) return '';
   try {
-    return mdParser.render(markdown);
+    const wrapped = autoWrapUnfencedMermaid(markdown);
+    const rawHtml = mdParser.render(wrapped);
+    // Replace any <div class="md-mermaid-block" data-mermaid="..."></div> with actual rendered pure SVG diagrams
+    return rawHtml.replace(
+      /<div class="md-mermaid-block[^"]*" data-mermaid="([^"]+)"><\/div>/g,
+      (_match, encoded) => {
+        try {
+          const decoded = decodeURIComponent(encoded);
+          const diag = getExportedMermaidDiagramSync(decoded, themeStyle);
+          return `<figure class="mermaid-export-figure" style="margin:18px 0;padding:14px;border-radius:12px;border:1px solid rgba(180,83,42,0.28);page-break-inside:avoid;break-inside:avoid;text-align:center;overflow-x:auto;">${diag.svg}</figure>`;
+        } catch {
+          return _match;
+        }
+      }
+    );
   } catch {
     return `<p>${escapeHtml(markdown)}</p>`;
   }
@@ -748,7 +1328,7 @@ export function parseDocumentWithMarkdownIt(content: string): ParsedMarkdownBloc
 
         if (depth > 0 && t.type === 'inline') {
           const rawItem = t.content.trim();
-          const taskMatch = rawItem.match(/^\[([ xX])\]\s+([\s\S]*)$/);
+          const taskMatch = rawItem.match(/^\[([ xX])\]\s*([\s\S]*)$/);
           if (taskMatch) {
             const checked = taskMatch[1].toLowerCase() === 'x';
             const cleanText = taskMatch[2].trim();
@@ -1163,11 +1743,44 @@ export function buildHtmlNotebookExport(
 </html>`;
 }
 
+export interface TxtExportOptions {
+  includeFullText?: boolean;
+  includeNotes?: boolean;
+  includeExcerpts?: boolean;
+  includeOutline?: boolean;
+  selectedChapterIds?: string[];
+}
+
 export function buildTxtExport(
   book: Book,
   annotations: Annotation[],
-  includeFullText: boolean
+  includeFullTextOrOpts: boolean | TxtExportOptions
 ): string {
+  const opts: TxtExportOptions =
+    typeof includeFullTextOrOpts === 'boolean'
+      ? {
+          includeFullText: includeFullTextOrOpts,
+          includeNotes: true,
+          includeExcerpts: true,
+          includeOutline: true,
+          selectedChapterIds: [],
+        }
+      : includeFullTextOrOpts;
+
+  const showFullText = Boolean(opts.includeFullText);
+  const showNotes = opts.includeNotes ?? true;
+  const showExcerpts = opts.includeExcerpts ?? true;
+  const showOutline = opts.includeOutline ?? true;
+  const allChapters =
+    book.chapters && book.chapters.length > 0
+      ? book.chapters
+      : extractChapters(book.content, book.format);
+  const selectedIds = opts.selectedChapterIds || [];
+  const chapters =
+    selectedIds.length > 0
+      ? allChapters.filter((ch) => selectedIds.includes(ch.id))
+      : allChapters;
+
   const lines: string[] = [
     `================================================`,
     `《${book.title}》 — 读书笔记与书摘归档`,
@@ -1175,33 +1788,52 @@ export function buildTxtExport(
     `导出时间：${new Date().toLocaleString('zh-CN')}`,
     `================================================`,
     ``,
-    `【书签与高亮书摘 (${annotations.length} 条)】`,
-    ``,
   ];
 
-  if (annotations.length === 0) {
-    lines.push('（暂无书签或批注）', '');
-  } else {
-    const sorted = [...annotations].sort((a, b) => a.charOffset - b.charOffset);
-    sorted.forEach((ann, i) => {
-      lines.push(
-        `${i + 1}. [${ann.chapterTitle}] (位置 ${ann.charOffset})`,
-        `   「${ann.selectedText}」`
-      );
-      if (ann.noteText) {
-        lines.push(`   批注：${ann.noteText}`);
-      }
-      lines.push('');
+  if (showOutline && chapters.length > 0) {
+    lines.push(`【章节目录大纲 (${chapters.length} 节)】`, ``);
+    chapters.forEach((ch, idx) => {
+      const indent = '  '.repeat(Math.max(0, (ch.level || 1) - 1));
+      lines.push(`${indent}${String(idx + 1).padStart(2, '0')}. ${ch.title} (${ch.wordCount} 字)`);
     });
+    lines.push(``);
   }
 
-  if (includeFullText) {
+  if (showNotes || showExcerpts) {
+    const sorted = [...annotations].sort((a, b) => a.charOffset - b.charOffset);
+    const filteredAnns =
+      !showExcerpts && showNotes
+        ? sorted.filter((a) => Boolean(a.noteText && a.noteText.trim()))
+        : sorted;
+
+    lines.push(`【书签与高亮书摘 (${filteredAnns.length} 条)】`, ``);
+    if (filteredAnns.length === 0) {
+      lines.push('（暂无书签或批注）', '');
+    } else {
+      filteredAnns.forEach((ann, i) => {
+        lines.push(`${i + 1}. [${ann.chapterTitle}] (位置 ${ann.charOffset})`);
+        if (showExcerpts) {
+          lines.push(`   「${ann.selectedText}」`);
+        }
+        if (showNotes && ann.noteText) {
+          lines.push(`   批注：${ann.noteText}`);
+        }
+        lines.push('');
+      });
+    }
+  }
+
+  if (showFullText) {
+    const bodyText =
+      selectedIds.length > 0
+        ? chapters.map((ch) => book.content.slice(ch.startOffset, ch.endOffset).trim()).join('\n\n')
+        : book.content;
     lines.push(
       `================================================`,
-      `【全书正文】`,
+      `【正文归档】`,
       `================================================`,
       ``,
-      book.content
+      bodyText
     );
   }
 
@@ -1214,10 +1846,16 @@ export function triggerFileDownload(filename: string, content: string, mimeType:
   const link = document.createElement('a');
   link.href = url;
   link.download = filename;
+  link.rel = 'noopener';
+  link.style.display = 'none';
   document.body.appendChild(link);
   link.click();
-  document.body.removeChild(link);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setTimeout(() => {
+    if (link.parentNode) {
+      link.parentNode.removeChild(link);
+    }
+    URL.revokeObjectURL(url);
+  }, 15000);
 }
 
 export function validateBackupJson(raw: string): FullLibraryBackup | null {
@@ -1238,4 +1876,13 @@ function escapeHtml(str: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function escapeXml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }

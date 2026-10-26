@@ -76,12 +76,15 @@ export type ReaderTheme = 'cafe' | 'cream' | 'sandalwood' | 'candlelight' | 'nig
 
 export type LayoutMode = 'paginated-double' | 'paginated-single' | 'scroll';
 
+export type MaxColumnWidth = 'narrow' | 'standard' | 'wide' | 'full';
+
 export type BuiltinFontFamily = 'serif-editorial' | 'sans-warm' | 'kaiti-classic' | 'mono-tabular';
 
 export interface ReaderSettings {
   theme: ReaderTheme;
   einkFlashRefresh: boolean;
   layoutMode: LayoutMode;
+  maxColumnWidth?: MaxColumnWidth; // 'narrow' (680px) | 'standard' (840px) | 'wide' (1040px) | 'full' (100%)
   fontFamily: BuiltinFontFamily | string; // Can be a customFontId
   fontSize: number; // 14 - 32
   lineHeight: number; // 1.4 - 2.2
@@ -94,6 +97,11 @@ export interface ReaderSettings {
   autoFlipPageInterval: number; // seconds per page (3 - 60)
   autoScrollSpeed: number; // pixels per second (15 - 120)
   dailyGoalMinutes: number;
+  ttsEngine?: 'edge' | 'local';
+  ttsEdgeVoice?: string;
+  ttsVoiceURI?: string;
+  ttsRate?: number; // 0.5 - 2.0
+  ttsPitch?: number; // 0.5 - 1.5
 }
 
 export interface ReadingStatsDaily {

@@ -1,5 +1,6 @@
 import { Book } from '../types/reader';
 import { extractChapters } from './parserEngine';
+import { GRAND_PATRIOTIC_TEST_MD_CONTENT } from './patrioticTestMd';
 
 const BELOVED_CHINA_MD_CONTENT = `# 第一章 铁窗下的赤子长歌
 
@@ -198,6 +199,18 @@ function buildSampleBook(
 }
 
 export const INITIAL_SAMPLE_BOOKS: Book[] = [
+  buildSampleBook(
+    'patriotic-grand-china-md-v5',
+    '华夏锦绣赋·新时代强国全景纪',
+    '华夏文萃院 · 万字MD全要素典藏',
+    '万字典藏',
+    'md',
+    'matcha',
+    GRAND_PATRIOTIC_TEST_MD_CONTENT,
+    0,
+    7200,
+    true
+  ),
   buildSampleBook(
     'patriotic-beloved-china-md-v4',
     '可爱的中国·赤子山河志',

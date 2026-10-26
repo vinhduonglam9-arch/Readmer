@@ -1,0 +1,6 @@
+{
+  "summary":  "更新焙香书阁语音朗读（听书模式）实施方案：新增「双引擎架构（本地离线 Web Speech API + 在线微软 Edge Neural TTS 超拟真角色语音库）」，支持晓晓、云希、云野、云健、晓伊、云扬等多角色音色选择、SSML 语速语调调节、下一段音频预加载缓冲与离线自动降级。",
+  "updatedAt":  "2026-10-26T04:55:12.264818594Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

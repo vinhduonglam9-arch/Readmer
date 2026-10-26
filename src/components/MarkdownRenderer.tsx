@@ -15,7 +15,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
-import { ReaderSettings, ReaderTheme } from '../types/reader';
+import { Annotation, ReaderSettings, ReaderTheme } from '../types/reader';
 import { PageBlock } from '../core/paginationEngine';
 import { renderInlineMarkdown, renderMermaidDiagram } from '../core/parserEngine';
 
@@ -474,6 +474,8 @@ export const MermaidBlock: React.FC<{
   const [renderError, setRenderError] = useState<string | null>(null);
   const [showRaw, setShowRaw] = useState(false);
   const [isZoomed, setIsZoomed] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [renderCount, setRenderCount] = useState(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const requestIdRef = useRef<number>(0);
@@ -497,6 +499,7 @@ export const MermaidBlock: React.FC<{
 
   useEffect(() => {
     const currentRequestId = ++requestIdRef.current;
+    setLoading(true);
     const renderDiagram = async () => {
       try {
         const viewportW = typeof window !== 'undefined' ? window.innerWidth : 1280;
@@ -512,16 +515,18 @@ export const MermaidBlock: React.FC<{
             height: result.naturalHeight,
           });
           setRenderError(null);
+          setLoading(false);
         }
       } catch (err) {
         if (isMountedRef.current && currentRequestId === requestIdRef.current) {
           setRenderError(err instanceof Error ? err.message : 'Mermaid 语法解析失败');
+          setLoading(false);
         }
       }
     };
 
     renderDiagram();
-  }, [code, theme, forceTopDown, isMobile, parentContainerWidth]);
+  }, [code, theme, forceTopDown, isMobile, parentContainerWidth, renderCount]);
 
   const viewportMaxW = typeof window !== 'undefined' ? window.innerWidth : 1280;
   const containerWidthPx = containerRef.current?.clientWidth || parentContainerWidth || 560;
@@ -665,13 +670,44 @@ export const MermaidBlock: React.FC<{
         </div>
       </div>
 
-      {showRaw || renderError ? (
+      {showRaw ? (
         <pre
           className="font-mono-tabular overflow-x-auto p-3 text-xs leading-relaxed"
           style={{ color: 'var(--text-primary)' }}
         >
-          {code}
+          <code>{code}</code>
         </pre>
+      ) : renderError ? (
+        <div className="p-3 text-xs space-y-2">
+          <div className="flex items-center justify-between text-amber-700 dark:text-amber-400 font-medium">
+            <span>图表解析失败: {renderError}</span>
+            <button
+              type="button"
+              onClick={() => setRenderCount((c) => c + 1)}
+              className="flex items-center gap-1 rounded px-2 py-0.5 underline cursor-pointer hover:opacity-80"
+            >
+              <RotateCcw className="h-3 w-3" />
+              <span>重新加载</span>
+            </button>
+          </div>
+          <pre
+            className="font-mono-tabular overflow-x-auto p-2.5 rounded-lg text-[11px] leading-relaxed"
+            style={{
+              backgroundColor: 'var(--bg-elevated)',
+              color: 'var(--text-secondary)',
+            }}
+          >
+            <code>{code}</code>
+          </pre>
+        </div>
+      ) : loading && !svgHtml ? (
+        <div
+          className="flex h-24 items-center justify-center text-xs"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          <Sparkles className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          <span>图表绘制中...</span>
+        </div>
       ) : (
         <div
           ref={gestureViewportRef}
@@ -737,7 +773,9 @@ export const MermaidBlock: React.FC<{
 export const CodeBlockView: React.FC<{
   code: string;
   lang?: string;
-}> = ({ code, lang }) => {
+  isContinuation?: boolean;
+  isLastBlock?: boolean;
+}> = ({ code, lang, isContinuation, isLastBlock = false }) => {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = () => {
@@ -748,7 +786,7 @@ export const CodeBlockView: React.FC<{
 
   return (
     <div
-      className="my-3 overflow-hidden rounded-xl"
+      className={`overflow-hidden rounded-xl ${isLastBlock ? 'mt-2 mb-0' : 'my-2.5'}`}
       style={{
         backgroundColor: 'var(--bg-surface)',
         border: '1px solid var(--border-subtle)',
@@ -765,7 +803,10 @@ export const CodeBlockView: React.FC<{
           color: 'var(--text-muted)',
         }}
       >
-        <span className="font-mono-tabular uppercase">{lang || 'text'}</span>
+        <span className="font-mono-tabular uppercase">
+          {lang || 'text'}
+          {isContinuation ? ' (续)' : ''}
+        </span>
         <button
           type="button"
           onClick={handleCopy}
@@ -786,229 +827,480 @@ export const CodeBlockView: React.FC<{
   );
 };
 
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function escapeAttr(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/**
+ * Safely wraps target substring inside HTML text nodes (skipping HTML tags `<...>`)
+ */
+function wrapTextNodesInHtml(
+  html: string,
+  targetPhrase: string,
+  replacer: (matched: string) => string
+): string {
+  const cleanPhrase = targetPhrase.trim();
+  if (!cleanPhrase || cleanPhrase.length < 2) return html;
+  const regex = new RegExp(`(<[^>]+>)|(${escapeRegExp(cleanPhrase)})`, 'gi');
+  return html.replace(regex, (fullMatch, htmlTag, textMatch) => {
+    if (htmlTag) return htmlTag;
+    if (textMatch) return replacer(textMatch);
+    return fullMatch;
+  });
+}
+
+function decorateHtmlWithInlineHighlights(
+  baseHtml: string,
+  blockText: string,
+  annotations: Annotation[] | undefined,
+  searchQuery?: string
+): string {
+  let result = baseHtml;
+
+  if (annotations && annotations.length > 0) {
+    // Sort longer selections first so longer highlights wrap cleanly
+    const relevantAnns = annotations
+      .filter((a) => a.type === 'note' && a.selectedText && a.selectedText.trim().length >= 2)
+      .sort((a, b) => b.selectedText.length - a.selectedText.length);
+
+    for (const ann of relevantAnns) {
+      const rawSel = ann.selectedText.trim();
+      // Match either full selectedText (if within this block) or the overlapping slice
+      let candidate = '';
+      if (blockText.includes(rawSel)) {
+        candidate = rawSel;
+      } else {
+        // Check if paragraph contains a substantial segment (e.g. split paragraph across pages)
+        const probe = rawSel.slice(0, Math.min(48, rawSel.length)).trim();
+        if (probe.length >= 4 && blockText.includes(probe)) {
+          candidate = probe;
+        }
+      }
+
+      if (candidate) {
+        const hasNoteClass = ann.noteText?.trim() ? ' reader-inline-mark-has-note' : '';
+        const tooltip = ann.noteText?.trim()
+          ? `批注：${escapeAttr(ann.noteText.trim())}（点击查看或编辑）`
+          : '点击编辑高亮、添加批注或生成金句卡';
+        result = wrapTextNodesInHtml(
+          result,
+          candidate,
+          (matched) =>
+            `<mark class="reader-inline-mark reader-inline-mark-${ann.color}${hasNoteClass}" data-ann-id="${escapeAttr(
+              ann.id
+            )}" title="${tooltip}">${matched}</mark>`
+        );
+      }
+    }
+  }
+
+  if (searchQuery && searchQuery.trim().length >= 1) {
+    const q = searchQuery.trim();
+    result = wrapTextNodesInHtml(
+      result,
+      q,
+      (matched) => `<mark class="reader-search-mark">${matched}</mark>`
+    );
+  }
+
+  return result;
+}
+
 export const MarkdownBlockRenderer: React.FC<{
   block: PageBlock;
   settings: ReaderSettings;
   highlightBg?: string;
+  annotations?: Annotation[];
+  searchHighlightQuery?: string;
+  onSelectAnnotation?: (ann: Annotation) => void;
   forceMermaidTD?: boolean;
   mermaidContainerWidth?: number;
   isLastBlock?: boolean;
+  isTtsActive?: boolean;
+  isTtsModeOpen?: boolean;
+  onClickBlockForTts?: (startOffset: number) => void;
 }> = ({
   block,
   settings,
   highlightBg = 'transparent',
+  annotations,
+  searchHighlightQuery,
+  onSelectAnnotation,
   forceMermaidTD = false,
   mermaidContainerWidth,
   isLastBlock = false,
+  isTtsActive = false,
+  isTtsModeOpen = false,
+  onClickBlockForTts,
 }) => {
-  switch (block.type) {
-    case 'heading': {
-      const level = block.level || 2;
-      const scale = level === 1 ? 1.36 : level === 2 ? 1.22 : 1.1;
-      return (
-        <h2
-          className="font-display font-semibold tracking-tight"
-          style={{
-            fontSize: `${Math.round(settings.fontSize * scale)}px`,
-            marginTop: `${Math.round(settings.paragraphSpacing * 0.85)}px`,
-            marginBottom: `${Math.round(settings.paragraphSpacing * 0.75)}px`,
-            color: 'var(--text-primary)',
-            textIndent: '0px',
-          }}
-          dangerouslySetInnerHTML={{
-            __html: block.html || renderInlineMarkdown(block.text),
-          }}
-        />
-      );
+  const handleInlineMarkClick = (e: React.MouseEvent<HTMLElement>) => {
+    const target = e.target as HTMLElement;
+    const markEl = target.closest?.('[data-ann-id]') as HTMLElement | null;
+    if (markEl && annotations && onSelectAnnotation) {
+      const annId = markEl.getAttribute('data-ann-id');
+      const found = annotations.find((a) => a.id === annId);
+      if (found) {
+        e.stopPropagation();
+        onSelectAnnotation(found);
+        return;
+      }
     }
+    if (isTtsModeOpen && onClickBlockForTts) {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
+        return;
+      }
+      // If the mouse click lands in the outer page-turn zones of the reading canvas (left 28% or right 28%),
+      // allow the click event to bubble to handleCanvasZoneClick so mouse users can effortlessly turn pages!
+      const canvasEl = target.closest('main');
+      if (canvasEl) {
+        const rect = canvasEl.getBoundingClientRect();
+        const ratioX = (e.clientX - rect.left) / rect.width;
+        if (ratioX < 0.28 || ratioX > 0.72) {
+          return;
+        }
+      }
+      e.stopPropagation();
+      onClickBlockForTts(block.startOffset);
+    }
+  };
 
-    case 'mermaid':
-      return (
-        <MermaidBlock
-          code={block.text}
-          theme={settings.theme}
-          forceTopDown={forceMermaidTD}
-          parentContainerWidth={mermaidContainerWidth}
-        />
-      );
+  const ttsWrapperStyle: React.CSSProperties | undefined = isTtsActive
+    ? {
+        backgroundColor:
+          settings.theme === 'night' || settings.theme === 'candlelight'
+            ? 'rgba(217, 119, 36, 0.16)'
+            : 'rgba(180, 83, 42, 0.11)',
+        boxShadow: 'inset 3px 0 0 0 var(--accent-primary)',
+        borderRadius: '8px',
+        paddingLeft: '8px',
+        paddingRight: '6px',
+        paddingTop: '2px',
+        paddingBottom: '2px',
+        transition: 'background-color 0.25s ease, box-shadow 0.25s ease',
+      }
+    : isTtsModeOpen
+    ? {
+        cursor: 'pointer',
+      }
+    : undefined;
 
-    case 'code':
-      return <CodeBlockView code={block.text} lang={block.lang} />;
-
-    case 'table': {
-      if (block.html) {
+  const renderInnerBlock = () => {
+    switch (block.type) {
+      case 'heading': {
+        const level = block.level || 2;
+        const scale = level === 1 ? 1.36 : level === 2 ? 1.22 : 1.1;
+        const rawHtml = block.html || renderInlineMarkdown(block.text);
+        const decoratedHtml = decorateHtmlWithInlineHighlights(
+          rawHtml,
+          block.text,
+          annotations,
+          searchHighlightQuery
+        );
         return (
-          <div
-            style={{ textIndent: '0px' }}
-            onClick={(e) => e.stopPropagation()}
-            dangerouslySetInnerHTML={{ __html: block.html }}
+          <h2
+            data-start-offset={block.startOffset}
+            onClick={handleInlineMarkClick}
+            className="font-display font-semibold tracking-tight"
+            style={{
+              fontSize: `${Math.round(settings.fontSize * scale)}px`,
+              marginTop: `${Math.round(settings.paragraphSpacing * 0.85)}px`,
+              marginBottom: `${Math.round(settings.paragraphSpacing * 0.75)}px`,
+              color: 'var(--text-primary)',
+              textIndent: '0px',
+              textWrap: 'balance',
+              ...ttsWrapperStyle,
+            }}
+            title={isTtsModeOpen ? '点击从此处开始朗读' : undefined}
+            dangerouslySetInnerHTML={{
+              __html: decoratedHtml,
+            }}
           />
         );
       }
-      const headers = block.tableHeaders || [];
-      const rows = block.tableRows || [];
-      const align = block.tableAlign || [];
-      return (
-        <div
-          className="reader-md-table-wrap my-3.5 overflow-x-auto rounded-xl"
-          style={{ textIndent: '0px' }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <table className="reader-md-table w-full border-collapse text-left text-xs sm:text-sm">
-            <thead className="reader-md-thead">
-              <tr>
-                {headers.map((h, i) => (
-                  <th
-                    key={i}
-                    className="reader-md-th px-3.5 py-2.5 font-semibold"
-                    style={{ textAlign: align[i] || 'left' }}
-                    dangerouslySetInnerHTML={{ __html: renderInlineMarkdown(h) }}
-                  />
-                ))}
-              </tr>
-            </thead>
-            <tbody className="reader-md-tbody">
-              {rows.map((row, rIdx) => (
-                <tr key={rIdx} className="reader-md-tr">
-                  {row.map((cell, cIdx) => (
-                    <td
-                      key={cIdx}
-                      className="reader-md-td tabular-nums px-3.5 py-2"
-                      style={{ textAlign: align[cIdx] || 'left' }}
-                      dangerouslySetInnerHTML={{ __html: renderInlineMarkdown(cell) }}
+
+      case 'mermaid':
+        return (
+          <div
+            data-start-offset={block.startOffset}
+            style={ttsWrapperStyle}
+            onClick={isTtsModeOpen ? handleInlineMarkClick : undefined}
+            title={isTtsModeOpen ? '点击朗读此图表摘要' : undefined}
+          >
+            <MermaidBlock
+              code={block.text}
+              theme={settings.theme}
+              forceTopDown={forceMermaidTD}
+              parentContainerWidth={mermaidContainerWidth}
+            />
+          </div>
+        );
+
+      case 'code':
+        return (
+          <div
+            data-start-offset={block.startOffset}
+            style={ttsWrapperStyle}
+            onClick={isTtsModeOpen ? handleInlineMarkClick : undefined}
+            title={isTtsModeOpen ? '点击朗读此代码块摘要' : undefined}
+          >
+            <CodeBlockView
+              code={block.text}
+              lang={block.lang}
+              isContinuation={block.isContinuation}
+              isLastBlock={isLastBlock}
+            />
+          </div>
+        );
+
+      case 'table': {
+        if (block.html) {
+          return (
+            <div
+              data-start-offset={block.startOffset}
+              className={isLastBlock ? 'mt-2 mb-0' : 'my-2.5'}
+              style={{ textIndent: '0px', ...ttsWrapperStyle }}
+              onClick={(e) => {
+                if (isTtsModeOpen) {
+                  handleInlineMarkClick(e);
+                } else {
+                  e.stopPropagation();
+                }
+              }}
+              title={isTtsModeOpen ? '点击朗读此表格摘要' : undefined}
+              dangerouslySetInnerHTML={{ __html: block.html }}
+            />
+          );
+        }
+        const headers = block.tableHeaders || [];
+        const rows = block.tableRows || [];
+        const align = block.tableAlign || [];
+        return (
+          <div
+            data-start-offset={block.startOffset}
+            className={`reader-md-table-wrap overflow-x-auto rounded-xl ${
+              isLastBlock ? 'mt-2 mb-0' : 'my-2.5'
+            }`}
+            style={{ textIndent: '0px', ...ttsWrapperStyle }}
+            onClick={(e) => {
+              if (isTtsModeOpen) {
+                handleInlineMarkClick(e);
+              } else {
+                e.stopPropagation();
+              }
+            }}
+            title={isTtsModeOpen ? '点击朗读此表格摘要' : undefined}
+          >
+            <table className="reader-md-table w-full border-collapse text-left text-xs sm:text-sm">
+              <thead className="reader-md-thead">
+                <tr>
+                  {headers.map((h, i) => (
+                    <th
+                      key={i}
+                      className="reader-md-th px-3.5 py-2.5 font-semibold"
+                      style={{ textAlign: align[i] || 'left' }}
+                      dangerouslySetInnerHTML={{ __html: renderInlineMarkdown(h) }}
                     />
                   ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      );
-    }
+              </thead>
+              <tbody className="reader-md-tbody">
+                {rows.map((row, rIdx) => (
+                  <tr key={rIdx} className="reader-md-tr">
+                    {row.map((cell, cIdx) => (
+                      <td
+                        key={cIdx}
+                        className="reader-md-td tabular-nums px-3.5 py-2"
+                        style={{ textAlign: align[cIdx] || 'left' }}
+                        dangerouslySetInnerHTML={{ __html: renderInlineMarkdown(cell) }}
+                      />
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      }
 
-    case 'blockquote': {
-      const alertMatch = block.text.match(
-        /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*\n?([\s\S]*)$/i
-      );
-      const alertType = alertMatch ? alertMatch[1].toUpperCase() : null;
-      const bodyText = alertMatch ? alertMatch[2] : block.text;
+      case 'blockquote': {
+        const alertMatch = block.text.match(
+          /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*\n?([\s\S]*)$/i
+        );
+        const alertType = alertMatch ? alertMatch[1].toUpperCase() : null;
+        const bodyText = alertMatch ? alertMatch[2] : block.text;
 
-      const AlertIcon =
-        alertType === 'TIP'
-          ? Lightbulb
-          : alertType === 'IMPORTANT'
-          ? Sparkles
-          : alertType === 'WARNING' || alertType === 'CAUTION'
-          ? AlertTriangle
-          : Info;
+        const AlertIcon =
+          alertType === 'TIP'
+            ? Lightbulb
+            : alertType === 'IMPORTANT'
+            ? Sparkles
+            : alertType === 'WARNING' || alertType === 'CAUTION'
+            ? AlertTriangle
+            : Info;
 
-      return (
-        <blockquote
-          className="my-3 rounded-xl p-3.5 text-[0.95em]"
-          style={{
-            backgroundColor: 'var(--bg-surface)',
-            border: '1px solid var(--border-subtle)',
-            color: 'var(--text-secondary)',
-            textIndent: '0px',
-          }}
-        >
-          {alertType && (
+        const decoratedQuoteHtml = decorateHtmlWithInlineHighlights(
+          renderInlineMarkdown(bodyText),
+          bodyText,
+          annotations,
+          searchHighlightQuery
+        );
+
+        return (
+          <blockquote
+            data-start-offset={block.startOffset}
+            onClick={handleInlineMarkClick}
+            className={`rounded-xl p-3.5 text-[0.95em] ${isLastBlock ? 'mt-2 mb-0' : 'my-2.5'}`}
+            style={{
+              backgroundColor: 'var(--bg-surface)',
+              border: '1px solid var(--border-subtle)',
+              color: 'var(--text-secondary)',
+              textIndent: '0px',
+              ...ttsWrapperStyle,
+            }}
+            title={isTtsModeOpen ? '点击从此处开始朗读' : undefined}
+          >
+            {alertType && (
+              <div
+                className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold"
+                style={{ color: 'var(--accent-primary)', textIndent: '0px' }}
+              >
+                <AlertIcon className="h-3.5 w-3.5" />
+                <span>{alertType}</span>
+              </div>
+            )}
             <div
-              className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold"
-              style={{ color: 'var(--accent-primary)', textIndent: '0px' }}
-            >
-              <AlertIcon className="h-3.5 w-3.5" />
-              <span>{alertType}</span>
-            </div>
-          )}
-          <div
-            className="leading-relaxed italic"
-            style={{ textIndent: '0px' }}
-            dangerouslySetInnerHTML={{ __html: renderInlineMarkdown(bodyText) }}
-          />
-        </blockquote>
-      );
-    }
+              className="leading-relaxed italic"
+              style={{ textIndent: '0px' }}
+              dangerouslySetInnerHTML={{ __html: decoratedQuoteHtml }}
+            />
+          </blockquote>
+        );
+      }
 
-    case 'list': {
-      const items = block.listItems || [];
-      const ListTag = block.ordered ? 'ol' : 'ul';
-      return (
-        <ListTag
-          className={`my-2.5 space-y-1.5 pl-5 ${
-            block.ordered ? 'list-decimal' : 'list-disc'
-          }`}
-          style={{
-            marginBottom: `${settings.paragraphSpacing}px`,
-            color: 'var(--text-primary)',
-            textIndent: '0px',
-          }}
-        >
-          {items.map((item, idx) => {
-            if (item.task) {
+      case 'list': {
+        const items = block.listItems || [];
+        const ListTag = block.ordered ? 'ol' : 'ul';
+        const isTaskList = items.some((item) => item.task);
+        return (
+          <ListTag
+            data-start-offset={block.startOffset}
+            onClick={handleInlineMarkClick}
+            start={block.ordered ? (block.start || 1) : undefined}
+            className={`space-y-1.5 ${isLastBlock ? 'mt-1.5 mb-0' : 'my-2'} ${
+              isTaskList
+                ? 'list-none pl-1'
+                : block.ordered
+                ? 'list-decimal pl-6'
+                : 'list-disc pl-6'
+            }`}
+            style={{
+              marginBottom: isLastBlock ? '0px' : `${Math.round(settings.paragraphSpacing * 0.7)}px`,
+              color: 'var(--text-primary)',
+              textIndent: '0px',
+              ...ttsWrapperStyle,
+            }}
+            title={isTtsModeOpen ? '点击从此处开始朗读' : undefined}
+          >
+            {items.map((item, idx) => {
+              const itemHtml = decorateHtmlWithInlineHighlights(
+                item.html || renderInlineMarkdown(item.text),
+                item.text,
+                annotations,
+                searchHighlightQuery
+              );
+              if (item.task) {
+                return (
+                  <li
+                    key={idx}
+                    className="flex list-none items-start gap-2.5 text-left"
+                    style={{ textIndent: '0px' }}
+                  >
+                    <span className="mt-0.5 flex shrink-0 items-center justify-center">
+                      {item.checked ? (
+                        <CheckSquare
+                          className="h-4.5 w-4.5"
+                          style={{ color: 'var(--accent-primary)' }}
+                        />
+                      ) : (
+                        <Square
+                          className="h-4.5 w-4.5"
+                          style={{ color: 'var(--text-muted)' }}
+                        />
+                      )}
+                    </span>
+                    <span
+                      className="flex-1 leading-relaxed"
+                      dangerouslySetInnerHTML={{
+                        __html: itemHtml,
+                      }}
+                    />
+                  </li>
+                );
+              }
               return (
                 <li
                   key={idx}
-                  className="flex list-none items-start gap-2 -ml-4"
+                  className="leading-relaxed text-left"
                   style={{ textIndent: '0px' }}
-                >
-                  {item.checked ? (
-                    <CheckSquare
-                      className="mt-1 h-4 w-4 shrink-0"
-                      style={{ color: 'var(--accent-primary)' }}
-                    />
-                  ) : (
-                    <Square
-                      className="mt-1 h-4 w-4 shrink-0"
-                      style={{ color: 'var(--text-muted)' }}
-                    />
-                  )}
-                  <span
-                    className={item.checked ? 'line-through opacity-75' : ''}
-                    dangerouslySetInnerHTML={{
-                      __html: item.html || renderInlineMarkdown(item.text),
-                    }}
-                  />
-                </li>
+                  dangerouslySetInnerHTML={{
+                    __html: itemHtml,
+                  }}
+                />
               );
-            }
-            return (
-              <li
-                key={idx}
-                style={{ textIndent: '0px' }}
-                dangerouslySetInnerHTML={{
-                  __html: item.html || renderInlineMarkdown(item.text),
-                }}
-              />
-            );
-          })}
-        </ListTag>
-      );
+            })}
+          </ListTag>
+        );
+      }
+
+      case 'hr':
+        return (
+          <hr
+            className="my-4 border-t"
+            style={{ borderColor: 'var(--border-subtle)' }}
+          />
+        );
+
+      case 'paragraph':
+      default: {
+        const baseHtml = block.html || renderInlineMarkdown(block.text);
+        const decoratedHtml = decorateHtmlWithInlineHighlights(
+          baseHtml,
+          block.text,
+          annotations,
+          searchHighlightQuery
+        );
+        return (
+          <p
+            data-start-offset={block.startOffset}
+            onClick={handleInlineMarkClick}
+            className="rounded-xs transition-colors [&_a]:underline [&_code]:rounded [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.88em] [&_strong]:font-semibold"
+            style={{
+              marginBottom: isLastBlock ? '0px' : `${settings.paragraphSpacing}px`,
+              textIndent: settings.indentFirstLine && !block.isContinuation ? '2em' : '0',
+              backgroundColor: highlightBg,
+              textAlign: 'justify',
+              wordBreak: 'break-word',
+              overflowWrap: 'break-word',
+              ...ttsWrapperStyle,
+            }}
+            title={isTtsModeOpen ? '点击从此处开始朗读' : undefined}
+            dangerouslySetInnerHTML={{
+              __html: decoratedHtml,
+            }}
+          />
+        );
+      }
     }
+  };
 
-    case 'hr':
-      return (
-        <hr
-          className="my-4 border-t"
-          style={{ borderColor: 'var(--border-subtle)' }}
-        />
-      );
-
-    case 'paragraph':
-    default:
-      return (
-        <p
-          className="rounded-xs transition-colors [&_a]:underline [&_code]:rounded [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.88em] [&_strong]:font-semibold"
-          style={{
-            marginBottom: isLastBlock ? '0px' : `${settings.paragraphSpacing}px`,
-            textIndent: settings.indentFirstLine && !block.isContinuation ? '2em' : '0',
-            backgroundColor: highlightBg,
-            textAlign: 'justify',
-          }}
-          dangerouslySetInnerHTML={{
-            __html: block.html || renderInlineMarkdown(block.text),
-          }}
-        />
-      );
-  }
+  return renderInnerBlock();
 };

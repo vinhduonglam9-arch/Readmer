@@ -108,7 +108,7 @@ export default function App() {
   // Vault Modal & Pending Action State
   const [vaultModalOpen, setVaultModalOpen] = useState(false);
   const [vaultModalMode, setVaultModalMode] = useState<VaultModalMode>('unlock');
-  const [pendingBookIdToEncrypt, setPendingBookIdToEncrypt] = useState<string | null>(null);
+  const [pendingBookIdsToEncrypt, setPendingBookIdsToEncrypt] = useState<string[]>([]);
   const [pendingEnterPrivateSpace, setPendingEnterPrivateSpace] = useState(false);
 
   // Window Blur & Auto-Lock Privacy Shield State
@@ -557,7 +557,7 @@ export default function App() {
 
       // Moving from Public Shelf to Private Space
       if (!vaultConfig?.isInitialized) {
-        setPendingBookIdToEncrypt(bookId);
+        setPendingBookIdsToEncrypt([bookId]);
         setPendingEnterPrivateSpace(false);
         setVaultModalMode('setup');
         setVaultModalOpen(true);
@@ -567,7 +567,7 @@ export default function App() {
       if (vaultKeyRef.current && isVaultUnlocked) {
         executeEncryptBookToVault(bookId, vaultKeyRef.current);
       } else {
-        setPendingBookIdToEncrypt(bookId);
+        setPendingBookIdsToEncrypt([bookId]);
         setPendingEnterPrivateSpace(false);
         setVaultModalMode('unlock');
         setVaultModalOpen(true);
@@ -592,7 +592,7 @@ export default function App() {
 
       // Batch encrypt public books into Private Space
       if (!vaultConfig?.isInitialized) {
-        setPendingBookIdToEncrypt(bookIds[0]);
+        setPendingBookIdsToEncrypt(bookIds);
         setPendingEnterPrivateSpace(false);
         setVaultModalMode('setup');
         setVaultModalOpen(true);
@@ -605,7 +605,7 @@ export default function App() {
           await executeEncryptBookToVault(id, key);
         }
       } else {
-        setPendingBookIdToEncrypt(bookIds[0]);
+        setPendingBookIdsToEncrypt(bookIds);
         setPendingEnterPrivateSpace(false);
         setVaultModalMode('unlock');
         setVaultModalOpen(true);
@@ -623,7 +623,7 @@ export default function App() {
   const handleEnterPrivateSpace = useCallback(() => {
     if (!vaultConfig?.isInitialized) {
       setPendingEnterPrivateSpace(true);
-      setPendingBookIdToEncrypt(null);
+      setPendingBookIdsToEncrypt([]);
       setVaultModalMode('setup');
       setVaultModalOpen(true);
       return;
@@ -637,7 +637,7 @@ export default function App() {
     }
 
     setPendingEnterPrivateSpace(true);
-    setPendingBookIdToEncrypt(null);
+    setPendingBookIdsToEncrypt([]);
     setVaultModalMode('unlock');
     setVaultModalOpen(true);
   }, [vaultConfig, isVaultUnlocked]);
@@ -679,9 +679,11 @@ export default function App() {
       await hydratePrivateVaultIntoMemory(key, books, annotations);
       setVaultModalOpen(false);
 
-      if (pendingBookIdToEncrypt) {
-        await executeEncryptBookToVault(pendingBookIdToEncrypt, key);
-        setPendingBookIdToEncrypt(null);
+      if (pendingBookIdsToEncrypt.length > 0) {
+        for (const id of pendingBookIdsToEncrypt) {
+          await executeEncryptBookToVault(id, key);
+        }
+        setPendingBookIdsToEncrypt([]);
       }
       if (pendingEnterPrivateSpace) {
         setIsPrivateSpaceMode(true);
@@ -694,7 +696,7 @@ export default function App() {
       books,
       annotations,
       hydratePrivateVaultIntoMemory,
-      pendingBookIdToEncrypt,
+      pendingBookIdsToEncrypt,
       pendingEnterPrivateSpace,
       executeEncryptBookToVault,
       showNotice,
@@ -710,9 +712,11 @@ export default function App() {
       const { elapsedMs } = await hydratePrivateVaultIntoMemory(key, books, annotations);
       setVaultModalOpen(false);
 
-      if (pendingBookIdToEncrypt) {
-        await executeEncryptBookToVault(pendingBookIdToEncrypt, key);
-        setPendingBookIdToEncrypt(null);
+      if (pendingBookIdsToEncrypt.length > 0) {
+        for (const id of pendingBookIdsToEncrypt) {
+          await executeEncryptBookToVault(id, key);
+        }
+        setPendingBookIdsToEncrypt([]);
       }
       if (pendingEnterPrivateSpace) {
         setIsPrivateSpaceMode(true);
@@ -727,7 +731,7 @@ export default function App() {
       books,
       annotations,
       hydratePrivateVaultIntoMemory,
-      pendingBookIdToEncrypt,
+      pendingBookIdsToEncrypt,
       pendingEnterPrivateSpace,
       executeEncryptBookToVault,
       showNotice,
@@ -876,6 +880,16 @@ export default function App() {
           }
           return { ...prev, [bookId]: updatedPlain };
         });
+
+        // Record anonymized daily reading stats for private books so daily goals stay accurate
+        if (secondsDelta > 0 || charsDelta > 0) {
+          setDailyStats((prevStats) => {
+            recordReadingProgressDelta(prevStats, 'private-vault', secondsDelta, charsDelta).then(
+              (updatedList) => setDailyStats(updatedList)
+            );
+            return prevStats;
+          });
+        }
         return;
       }
 
@@ -936,6 +950,13 @@ export default function App() {
             setAnnotations(refreshed.annotations);
             setDailyStats(refreshed.dailyStats);
             setSettings(refreshed.settings);
+            if (vaultKeyRef.current) {
+              await hydratePrivateVaultIntoMemory(
+                vaultKeyRef.current,
+                refreshed.books,
+                refreshed.annotations
+              );
+            }
             showNotice(`已恢复 ${refreshed.books.length} 册书籍`);
             continue;
           }
@@ -1108,6 +1129,26 @@ export default function App() {
     [books]
   );
 
+  const handleUpdateAnnotation = useCallback(
+    (updatedAnn: Annotation) => {
+      const targetBook = books.find((b) => b.id === updatedAnn.bookId);
+      const isPrivateBook = Boolean(targetBook?.isPrivate || updatedAnn.isPrivate);
+
+      if (isPrivateBook && vaultKeyRef.current) {
+        setDecryptedAnnsMap((prev) => ({ ...prev, [updatedAnn.id]: updatedAnn }));
+        encryptAnnotationForStorage(updatedAnn, vaultKeyRef.current).then((encAnn) => {
+          saveAnnotation(encAnn);
+          setAnnotations((prev) => prev.map((a) => (a.id === updatedAnn.id ? encAnn : a)));
+        });
+        return;
+      }
+
+      saveAnnotation(updatedAnn);
+      setAnnotations((prev) => prev.map((a) => (a.id === updatedAnn.id ? updatedAnn : a)));
+    },
+    [books]
+  );
+
   const handleDeleteAnnotation = useCallback((annId: string) => {
     removeAnnotation(annId);
     setDecryptedAnnsMap((prev) => {
@@ -1163,8 +1204,16 @@ export default function App() {
       setAnnotations(refreshed.annotations);
       setDailyStats(refreshed.dailyStats);
       setSettings(refreshed.settings);
+      if (vaultKeyRef.current) {
+        await hydratePrivateVaultIntoMemory(
+          vaultKeyRef.current,
+          refreshed.books,
+          refreshed.annotations
+        );
+      }
+      showNotice(`已恢复 ${refreshed.books.length} 册书籍`);
     },
-    [showNotice]
+    [showNotice, hydratePrivateVaultIntoMemory]
   );
 
   if (!isLoaded) {
@@ -1198,6 +1247,7 @@ export default function App() {
             onUpdateBookOffset={handleUpdateBookOffset}
             onUpdateSettings={handleUpdateSettings}
             onAddAnnotation={handleAddAnnotation}
+            onUpdateAnnotation={handleUpdateAnnotation}
             onDeleteAnnotation={handleDeleteAnnotation}
             onUploadCustomFont={handleUploadCustomFont}
             onLockVault={isReadingPrivateBook ? handleLockVaultAndExit : undefined}
@@ -1485,13 +1535,13 @@ export default function App() {
         mode={vaultModalMode}
         vaultConfig={vaultConfig}
         pendingActionLabel={
-          pendingBookIdToEncrypt
-            ? '验证主密码后将该书加密移入私密空间'
+          pendingBookIdsToEncrypt.length > 0
+            ? `验证主密码后将 ${pendingBookIdsToEncrypt.length} 册书籍加密移入私密空间`
             : '验证主密码后进入独立私密空间（当前会话免密秒开）'
         }
         onClose={() => {
           setVaultModalOpen(false);
-          setPendingBookIdToEncrypt(null);
+          setPendingBookIdsToEncrypt([]);
           setPendingEnterPrivateSpace(false);
         }}
         onSetupMasterPassword={handleSetupMasterPassword}

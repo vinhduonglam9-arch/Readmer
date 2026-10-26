@@ -16,9 +16,11 @@ import {
   Flame,
   Gauge,
   Hash,
+  Headphones,
   Image as ImageIcon,
   Indent,
   List,
+  Loader2,
   Lock,
   Moon,
   PanelLeftClose,
@@ -26,14 +28,19 @@ import {
   Pause,
   Play,
   Printer,
+  RotateCcw,
   ScrollText,
   Search,
+  SkipBack,
+  SkipForward,
   Sliders,
   Sparkles,
+  Square,
   Sun,
   Trash2,
   Type,
   Unlock,
+  Volume2,
   X,
   Zap,
 } from 'lucide-react';
@@ -44,14 +51,21 @@ import {
   CustomFont,
   HighlightColor,
   LayoutMode,
+  MaxColumnWidth,
   ReaderSettings,
   ReaderTheme,
   ReadingStatsDaily,
 } from '../types/reader';
 import {
+  detectInstalledLocalFonts,
   findChapterTitleAtOffset,
   findPageIndexForOffset,
+  getMaxColumnWidthPx,
+  getShortLocalFontLabel,
+  InstalledSystemFont,
   paginateBookContent,
+  queryBrowserLocalFonts,
+  resolveReaderFontFamilyCss,
   VirtualPage,
 } from '../core/paginationEngine';
 import {
@@ -64,7 +78,20 @@ import {
   renderJsPdfPages,
   warmUpCjkPdfFont,
 } from '../core/exportEngine';
-import { extractChapters } from '../core/parserEngine';
+import {
+  extractChapters,
+  parseDocumentWithMarkdownIt,
+  warmUpMermaidDiagramsForContent,
+} from '../core/parserEngine';
+import { DEFAULT_READER_SETTINGS } from '../core/storageEngine';
+import {
+  buildBlockSpeechText,
+  EDGE_NEURAL_VOICES,
+  getSortedLocalVoices,
+  LocalVoiceOption,
+  prefetchEdgeSpeech,
+  synthesizeEdgeSpeechUrl,
+} from '../core/ttsEngine';
 import { ExportStudioModal } from './ExportStudioModal';
 import { MarkdownBlockRenderer } from './MarkdownRenderer';
 import { QuoteCardModal } from './QuoteCardModal';
@@ -156,6 +183,7 @@ interface ReaderViewProps {
   ) => void;
   onUpdateSettings: (partial: Partial<ReaderSettings>) => void;
   onAddAnnotation: (ann: Omit<Annotation, 'id' | 'createdAt'>) => void;
+  onUpdateAnnotation?: (ann: Annotation) => void;
   onDeleteAnnotation: (annId: string) => void;
   onUploadCustomFont: (file: File) => Promise<void>;
   onLockVault?: () => void;
@@ -172,6 +200,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   onUpdateBookOffset,
   onUpdateSettings,
   onAddAnnotation,
+  onUpdateAnnotation,
   onDeleteAnnotation,
   onUploadCustomFont,
   onLockVault,
@@ -202,12 +231,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [outlineOpen, setOutlineOpen] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.innerWidth >= 1180 : false
   );
-  const [tocTab, setTocTab] = useState<'chapters' | 'annotations'>('chapters');
+  const [tocTab, setTocTab] = useState<'chapters' | 'annotations' | 'search'>('chapters');
   const [chapterSearch, setChapterSearch] = useState('');
+  const [fullTextSearchQuery, setFullTextSearchQuery] = useState('');
   const [einkFlashing, setEinkFlashing] = useState(false);
   const [autoFlipProgress, setAutoFlipProgress] = useState(0);
   const [isAutoPausedByHover, setIsAutoPausedByHover] = useState(false);
   const [scrubberVisible, setScrubberVisible] = useState(false);
+  const [installedLocalFonts, setInstalledLocalFonts] = useState<InstalledSystemFont[]>(() =>
+    detectInstalledLocalFonts()
+  );
+  const [localFontPickerOpen, setLocalFontPickerOpen] = useState(false);
+  const [customLocalFontInput, setCustomLocalFontInput] = useState('');
   const touchStartPos = useRef<{ x: number; y: number; time: number } | null>(null);
   const touchSwipedRef = useRef(false);
 
@@ -218,6 +253,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   } | null>(null);
   const [noteInput, setNoteInput] = useState('');
   const [selectedColor, setSelectedColor] = useState<HighlightColor>('amber');
+
+  // Inspect / edit existing inline annotation popover
+  const [activeInspectAnnotation, setActiveInspectAnnotation] = useState<Annotation | null>(null);
+  const [editAnnNote, setEditAnnNote] = useState('');
+  const [editAnnColor, setEditAnnColor] = useState<HighlightColor>('amber');
+
+  // Reading position jump-back history pill state
+  const [jumpBackState, setJumpBackState] = useState<{
+    pageIndex: number;
+    offset: number;
+  } | null>(null);
+  const jumpBackTimerRef = useRef<number | null>(null);
 
   const [viewportDim, setViewportDim] = useState<{
     viewportWidth: number;
@@ -230,6 +277,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const readerCanvasRef = useRef<HTMLElement>(null);
   const fontInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const lastTrackedOffsetRef = useRef<number>(book.currentOffset);
 
   const [mermaidContainerWidth, setMermaidContainerWidth] = useState<number>(() =>
@@ -239,15 +287,23 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     typeof window !== 'undefined' ? window.innerWidth < 640 : false
   );
 
+  // Debounced window resize handler (80ms) so resizing or orientation changes don't thrash layout
   useEffect(() => {
+    let timer: number | null = null;
     const handleResize = () => {
-      setViewportDim({
-        viewportWidth: window.innerWidth,
-        viewportHeight: window.innerHeight,
-      });
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        setViewportDim({
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+        });
+      }, 80);
     };
     window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    return () => {
+      if (timer) window.clearTimeout(timer);
+      window.removeEventListener('resize', handleResize);
+    };
   }, []);
 
   // Automatically parse hierarchical Markdown headings (#, ##, ###, ####) & chapters for the Outline
@@ -255,6 +311,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const parsed = extractChapters(book.content, book.format);
     return parsed.length > 0 ? parsed : book.chapters;
   }, [book.content, book.format, book.chapters]);
+
+  // Cache AST blocks separately from typography/viewport settings so font/margin/resize changes
+  // skip Markdown-It AST re-parsing and run pagination in <5ms
+  const parsedBlocks = useMemo(() => {
+    return parseDocumentWithMarkdownIt(book.content);
+  }, [book.content]);
 
   const isDesktopSplitOutline = outlineOpen && viewportDim.viewportWidth >= 1024;
   const effectiveCanvasWidth = isDesktopSplitOutline
@@ -277,7 +339,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         viewportWidth: effectiveCanvasWidth,
         viewportHeight: viewportDim.viewportHeight,
       },
-      isSpreadMode
+      isSpreadMode,
+      parsedBlocks
     );
   }, [
     book.content,
@@ -286,6 +349,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     effectiveCanvasWidth,
     viewportDim.viewportHeight,
     isSpreadMode,
+    parsedBlocks,
   ]);
 
   const pageStep = isSpreadMode ? 2 : 1;
@@ -301,6 +365,31 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const aligned = isSpreadMode && raw % 2 === 1 ? Math.max(0, raw - 1) : raw;
     setPageIndex(Math.max(0, Math.min(virtualPages.length - 1, aligned)));
   }, [virtualPages.length, isSpreadMode, book.id]);
+
+  // Restore scroll position when entering scroll mode or switching books in scroll mode
+  useEffect(() => {
+    if (isPaginated) return;
+    const timer = window.setTimeout(() => {
+      const container = scrollContainerRef.current;
+      if (!container) return;
+      const targetPage = virtualPages[pageIndex];
+      const firstBlockOffset = targetPage?.paragraphs[0]?.startOffset;
+      if (firstBlockOffset !== undefined) {
+        const blockEl = container.querySelector<HTMLElement>(
+          `[data-start-offset="${firstBlockOffset}"]`
+        );
+        if (blockEl) {
+          blockEl.scrollIntoView({ behavior: 'auto', block: 'start' });
+          return;
+        }
+      }
+      if (book.totalChars > 0) {
+        const maxScroll = Math.max(1, container.scrollHeight - container.clientHeight);
+        container.scrollTop = (book.currentOffset / book.totalChars) * maxScroll;
+      }
+    }, 30);
+    return () => window.clearTimeout(timer);
+  }, [isPaginated, book.id]);
 
   // ResizeObserver for Mermaid containers inside ReaderView:
   // When observed container width < 300px, automatically switch Mermaid direction to TD (Top-Down)
@@ -369,6 +458,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     }
   }, [settings.theme, settings.einkFlashRefresh]);
 
+  const pageIndexRef = useRef(pageIndex);
+  pageIndexRef.current = pageIndex;
+  const isSpreadModeRef = useRef(isSpreadMode);
+  isSpreadModeRef.current = isSpreadMode;
+
   const goToPageIndex = useCallback(
     (targetIdx: number) => {
       if (totalPages === 0) return;
@@ -379,6 +473,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       if (!targetPage) return;
 
       setPageIndex(alignedIdx);
+      pageIndexRef.current = alignedIdx;
       triggerEinkRefreshIfNeeded();
 
       const charsDelta = Math.max(
@@ -399,23 +494,426 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     ]
   );
 
+  const recordJumpOrigin = useCallback(
+    (fromPageIdx: number) => {
+      const fromOffset = virtualPages[fromPageIdx]?.startOffset ?? book.currentOffset;
+      setJumpBackState({ pageIndex: fromPageIdx, offset: fromOffset });
+      if (jumpBackTimerRef.current) {
+        window.clearTimeout(jumpBackTimerRef.current);
+      }
+      jumpBackTimerRef.current = window.setTimeout(() => {
+        setJumpBackState(null);
+      }, 9000);
+    },
+    [virtualPages, book.currentOffset]
+  );
+
+  // ============================================================================
+  // Dual-Engine TTS (Microsoft Edge Neural TTS + Local Web Speech API) Controller
+  // ============================================================================
+  const [ttsBarOpen, setTtsBarOpen] = useState(false);
+  const [ttsSettingsOpen, setTtsSettingsOpen] = useState(false);
+  const [ttsStatus, setTtsStatus] = useState<'idle' | 'loading' | 'playing' | 'paused'>('idle');
+  const [activeTtsBlockIdx, setActiveTtsBlockIdx] = useState<number | null>(null);
+  const [localVoices, setLocalVoices] = useState<LocalVoiceOption[]>([]);
+  const [ttsToast, setTtsToast] = useState<string | null>(null);
+
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsAbortRef = useRef<AbortController | null>(null);
+  const ttsSessionIdRef = useRef<number>(0);
+
+  const ttsEngine = settings.ttsEngine || 'edge';
+  const ttsEdgeVoice = settings.ttsEdgeVoice || 'zh-CN-XiaoxiaoNeural';
+  const ttsVoiceURI = settings.ttsVoiceURI || '';
+  const ttsRate = settings.ttsRate ?? 1.0;
+  const ttsPitch = settings.ttsPitch ?? 1.0;
+
+  // Flatten all narratable blocks across virtualPages with their pageIndex and pre-built speech text
+  const narratableBlocks = useMemo(() => {
+    const list: {
+      block: VirtualPage['paragraphs'][number];
+      pageIndex: number;
+      speechText: string;
+    }[] = [];
+    virtualPages.forEach((vp, pIdx) => {
+      vp.paragraphs.forEach((blk) => {
+        const speechText = buildBlockSpeechText(blk);
+        if (speechText && speechText.trim().length > 0) {
+          list.push({
+            block: blk,
+            pageIndex: pIdx,
+            speechText: speechText.trim(),
+          });
+        }
+      });
+    });
+    return list;
+  }, [virtualPages]);
+
+  const activeTtsOffset = useMemo(() => {
+    if (activeTtsBlockIdx === null || !narratableBlocks[activeTtsBlockIdx]) return null;
+    return narratableBlocks[activeTtsBlockIdx].block.startOffset;
+  }, [activeTtsBlockIdx, narratableBlocks]);
+
+  // Load browser local voices & subscribe to voiceschanged
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    const updateVoices = () => {
+      const sorted = getSortedLocalVoices();
+      setLocalVoices(sorted);
+    };
+    updateVoices();
+    window.speechSynthesis.addEventListener?.('voiceschanged', updateVoices);
+    return () => {
+      window.speechSynthesis.removeEventListener?.('voiceschanged', updateVoices);
+    };
+  }, []);
+
+  const stopAllTtsPlayback = useCallback((resetActiveBlock = false) => {
+    ttsSessionIdRef.current += 1;
+    if (ttsAbortRef.current) {
+      ttsAbortRef.current.abort();
+      ttsAbortRef.current = null;
+    }
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.onended = null;
+      ttsAudioRef.current.onerror = null;
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current.src = '';
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setTtsStatus('idle');
+    if (resetActiveBlock) {
+      setActiveTtsBlockIdx(null);
+    }
+  }, []);
+
+  // Stop TTS cleanly on unmount or when switching books
+  useEffect(() => {
+    return () => {
+      stopAllTtsPlayback(true);
+    };
+  }, [book.id, stopAllTtsPlayback]);
+
+  // Scroll active paragraph into view or flip page automatically when activeTtsBlockIdx changes
+  useEffect(() => {
+    if (activeTtsBlockIdx === null) return;
+    const item = narratableBlocks[activeTtsBlockIdx];
+    if (!item) return;
+
+    if (isPaginated) {
+      const visibleStart = pageIndexRef.current;
+      const visibleEnd = isSpreadModeRef.current ? visibleStart + 1 : visibleStart;
+      if (item.pageIndex < visibleStart || item.pageIndex > visibleEnd) {
+        goToPageIndex(item.pageIndex);
+      }
+      // Also ensure paragraph is visible inside column if column scrolls
+      setTimeout(() => {
+        const el = readerCanvasRef.current?.querySelector<HTMLElement>(
+          `[data-start-offset="${item.block.startOffset}"]`
+        );
+        el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }, 60);
+    } else {
+      const el = scrollContainerRef.current?.querySelector<HTMLElement>(
+        `[data-start-offset="${item.block.startOffset}"]`
+      );
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }
+  }, [activeTtsBlockIdx, narratableBlocks, isPaginated, goToPageIndex]);
+
+  const speakBlockAtIndex = useCallback(
+    async (
+      targetIdx: number,
+      overrideParams?: {
+        engine?: 'edge' | 'local';
+        edgeVoice?: string;
+        localVoiceURI?: string;
+        rate?: number;
+        pitch?: number;
+      }
+    ) => {
+      if (narratableBlocks.length === 0) return;
+      if (targetIdx < 0 || targetIdx >= narratableBlocks.length) {
+        stopAllTtsPlayback(false);
+        return;
+      }
+
+      stopAllTtsPlayback(false);
+      const currentSession = ttsSessionIdRef.current;
+      const item = narratableBlocks[targetIdx];
+      setActiveTtsBlockIdx(targetIdx);
+
+      const useEngine = overrideParams?.engine ?? ttsEngine;
+      const useEdgeVoice = overrideParams?.edgeVoice ?? ttsEdgeVoice;
+      const useLocalURI = overrideParams?.localVoiceURI ?? ttsVoiceURI;
+      const useRate = overrideParams?.rate ?? ttsRate;
+      const usePitch = overrideParams?.pitch ?? ttsPitch;
+
+      const speakWithLocalWebSpeech = () => {
+        if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+          setTtsToast('当前浏览器不支持 Web Speech API');
+          setTtsStatus('idle');
+          return;
+        }
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(item.speechText);
+        utterance.rate = Math.max(0.5, Math.min(2.0, useRate));
+        utterance.pitch = Math.max(0.5, Math.min(1.5, usePitch));
+
+        const voices = getSortedLocalVoices();
+        const matched =
+          voices.find((v) => v.voice.voiceURI === useLocalURI)?.voice ||
+          voices.find((v) => v.isChinese && v.isOfflineLocal)?.voice ||
+          voices.find((v) => v.isChinese)?.voice ||
+          voices[0]?.voice;
+
+        if (matched) {
+          utterance.voice = matched;
+          utterance.lang = matched.lang;
+        } else {
+          utterance.lang = 'zh-CN';
+        }
+
+        utterance.onstart = () => {
+          if (ttsSessionIdRef.current === currentSession) {
+            setTtsStatus('playing');
+          }
+        };
+
+        utterance.onend = () => {
+          if (ttsSessionIdRef.current !== currentSession) return;
+          if (targetIdx + 1 < narratableBlocks.length) {
+            speakBlockAtIndex(targetIdx + 1, overrideParams);
+          } else {
+            setTtsStatus('idle');
+          }
+        };
+
+        utterance.onerror = (ev) => {
+          if (ev.error === 'interrupted' || ev.error === 'canceled') return;
+          if (ttsSessionIdRef.current === currentSession) {
+            setTtsStatus('idle');
+          }
+        };
+
+        setTtsStatus('playing');
+        window.speechSynthesis.speak(utterance);
+      };
+
+      if (useEngine === 'edge') {
+        try {
+          setTtsStatus('loading');
+          const abortCtrl = new AbortController();
+          ttsAbortRef.current = abortCtrl;
+
+          const audioUrl = await synthesizeEdgeSpeechUrl(
+            item.speechText,
+            useEdgeVoice,
+            useRate,
+            usePitch,
+            abortCtrl.signal
+          );
+
+          if (ttsSessionIdRef.current !== currentSession) return;
+
+          // Pre-fetch next paragraph in background for zero-lag transition
+          const nextItem = narratableBlocks[targetIdx + 1];
+          if (nextItem) {
+            prefetchEdgeSpeech(nextItem.speechText, useEdgeVoice, useRate, usePitch);
+          }
+
+          if (!ttsAudioRef.current) {
+            ttsAudioRef.current = new Audio();
+          }
+          const audio = ttsAudioRef.current;
+          audio.src = audioUrl;
+          audio.onended = () => {
+            if (ttsSessionIdRef.current !== currentSession) return;
+            if (targetIdx + 1 < narratableBlocks.length) {
+              speakBlockAtIndex(targetIdx + 1, overrideParams);
+            } else {
+              setTtsStatus('idle');
+            }
+          };
+          audio.onerror = () => {
+            if (ttsSessionIdRef.current !== currentSession) return;
+            speakWithLocalWebSpeech();
+          };
+
+          await audio.play();
+          if (ttsSessionIdRef.current === currentSession) {
+            setTtsStatus('playing');
+          }
+        } catch (err) {
+          if ((err as Error)?.name === 'AbortError') return;
+          if (ttsSessionIdRef.current !== currentSession) return;
+          setTtsToast('在线微软语音连接受限，已无缝切换至本地离线语音');
+          setTimeout(() => setTtsToast(null), 3500);
+          speakWithLocalWebSpeech();
+        }
+      } else {
+        speakWithLocalWebSpeech();
+      }
+    },
+    [
+      narratableBlocks,
+      stopAllTtsPlayback,
+      ttsEngine,
+      ttsEdgeVoice,
+      ttsVoiceURI,
+      ttsRate,
+      ttsPitch,
+    ]
+  );
+
+  const findInitialBlockIdxForCurrentView = useCallback((): number => {
+    if (
+      activeTtsBlockIdx !== null &&
+      narratableBlocks[activeTtsBlockIdx] &&
+      Math.abs(narratableBlocks[activeTtsBlockIdx].pageIndex - pageIndex) <= 1
+    ) {
+      return activeTtsBlockIdx;
+    }
+    const foundOnCurrentPage = narratableBlocks.findIndex((b) => b.pageIndex >= pageIndex);
+    return foundOnCurrentPage !== -1 ? foundOnCurrentPage : 0;
+  }, [activeTtsBlockIdx, narratableBlocks, pageIndex]);
+
+  const handleToggleTtsPlayPause = useCallback(() => {
+    if (ttsStatus === 'playing') {
+      if (ttsEngine === 'edge' && ttsAudioRef.current) {
+        ttsAudioRef.current.pause();
+        setTtsStatus('paused');
+      } else if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.pause();
+        setTtsStatus('paused');
+      }
+      return;
+    }
+
+    if (ttsStatus === 'paused') {
+      if (ttsEngine === 'edge' && ttsAudioRef.current && ttsAudioRef.current.src) {
+        ttsAudioRef.current.play().catch(() => {
+          const idx = findInitialBlockIdxForCurrentView();
+          speakBlockAtIndex(idx);
+        });
+        setTtsStatus('playing');
+      } else if (
+        typeof window !== 'undefined' &&
+        'speechSynthesis' in window &&
+        window.speechSynthesis.paused
+      ) {
+        window.speechSynthesis.resume();
+        setTtsStatus('playing');
+      } else {
+        const idx = findInitialBlockIdxForCurrentView();
+        speakBlockAtIndex(idx);
+      }
+      return;
+    }
+
+    // Start from current page or active block
+    const startIdx = findInitialBlockIdxForCurrentView();
+    speakBlockAtIndex(startIdx);
+  }, [ttsStatus, ttsEngine, findInitialBlockIdxForCurrentView, speakBlockAtIndex]);
+
+  const handleJumpAndSpeakAtOffset = useCallback(
+    (startOffset: number) => {
+      const idx = narratableBlocks.findIndex((b) => b.block.startOffset === startOffset);
+      if (idx !== -1) {
+        setTtsBarOpen(true);
+        speakBlockAtIndex(idx);
+      }
+    },
+    [narratableBlocks, speakBlockAtIndex]
+  );
+
+  const syncTtsToPage = useCallback(
+    (targetPageIdx: number) => {
+      if (!ttsBarOpen || narratableBlocks.length === 0) return;
+      const foundIdx = narratableBlocks.findIndex((b) => b.pageIndex >= targetPageIdx);
+      const targetBlockIdx = foundIdx !== -1 ? foundIdx : narratableBlocks.length - 1;
+
+      if (ttsStatus === 'playing' || ttsStatus === 'loading') {
+        speakBlockAtIndex(targetBlockIdx);
+      } else {
+        stopAllTtsPlayback(false);
+        setActiveTtsBlockIdx(targetBlockIdx);
+      }
+    },
+    [ttsBarOpen, narratableBlocks, ttsStatus, speakBlockAtIndex, stopAllTtsPlayback]
+  );
+
+  const syncTtsToOffset = useCallback(
+    (charOffset: number) => {
+      if (!ttsBarOpen || narratableBlocks.length === 0) return;
+      let foundIdx = narratableBlocks.findIndex((b) => b.block.startOffset >= charOffset);
+      if (foundIdx === -1) {
+        const targetPage = findPageIndexForOffset(virtualPages, charOffset);
+        foundIdx = narratableBlocks.findIndex((b) => b.pageIndex >= targetPage);
+      }
+      const targetBlockIdx = foundIdx !== -1 ? foundIdx : 0;
+
+      if (ttsStatus === 'playing' || ttsStatus === 'loading') {
+        speakBlockAtIndex(targetBlockIdx);
+      } else {
+        stopAllTtsPlayback(false);
+        setActiveTtsBlockIdx(targetBlockIdx);
+      }
+    },
+    [ttsBarOpen, narratableBlocks, ttsStatus, virtualPages, speakBlockAtIndex, stopAllTtsPlayback]
+  );
+
   const jumpToCharOffset = useCallback(
     (charOffset: number) => {
       const targetIdx = findPageIndexForOffset(virtualPages, charOffset);
+      if (Math.abs(targetIdx - pageIndex) > 2) {
+        recordJumpOrigin(pageIndex);
+      }
       goToPageIndex(targetIdx);
+
+      // In audiobook mode, sync speech position so it reads content immediately
+      if (ttsBarOpen) {
+        syncTtsToOffset(charOffset);
+      }
+
       if (!isPaginated && scrollContainerRef.current && book.totalChars > 0) {
         const el = scrollContainerRef.current;
-        const maxScroll = Math.max(1, el.scrollHeight - el.clientHeight);
-        el.scrollTo({
-          top: (charOffset / book.totalChars) * maxScroll,
-          behavior: 'smooth',
-        });
+        const targetPage = virtualPages[targetIdx];
+        const firstBlockOffset = targetPage?.paragraphs[0]?.startOffset;
+        const blockEl =
+          firstBlockOffset !== undefined
+            ? el.querySelector<HTMLElement>(`[data-start-offset="${firstBlockOffset}"]`)
+            : null;
+        if (blockEl) {
+          blockEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        } else {
+          const maxScroll = Math.max(1, el.scrollHeight - el.clientHeight);
+          el.scrollTo({
+            top: (charOffset / book.totalChars) * maxScroll,
+            behavior: 'smooth',
+          });
+        }
       }
       if (viewportDim.viewportWidth < 1024) {
         setOutlineOpen(false);
       }
     },
-    [virtualPages, goToPageIndex, isPaginated, book.totalChars, viewportDim.viewportWidth]
+    [
+      virtualPages,
+      pageIndex,
+      recordJumpOrigin,
+      goToPageIndex,
+      ttsBarOpen,
+      syncTtsToOffset,
+      isPaginated,
+      book.totalChars,
+      viewportDim.viewportWidth,
+    ]
   );
 
   const handleNextPage = useCallback(() => {
@@ -428,10 +926,23 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       }
       return;
     }
-    if (pageIndex + pageStep < totalPages) {
-      goToPageIndex(pageIndex + pageStep);
+    const nextIdx = pageIndex + pageStep;
+    if (nextIdx < totalPages) {
+      goToPageIndex(nextIdx);
+      if (ttsBarOpen) {
+        syncTtsToPage(nextIdx);
+      }
     }
-  }, [isPaginated, pageIndex, pageStep, totalPages, goToPageIndex, viewportDim.viewportHeight]);
+  }, [
+    isPaginated,
+    pageIndex,
+    pageStep,
+    totalPages,
+    goToPageIndex,
+    viewportDim.viewportHeight,
+    ttsBarOpen,
+    syncTtsToPage,
+  ]);
 
   const handlePrevPage = useCallback(() => {
     if (!isPaginated) {
@@ -443,10 +954,22 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       }
       return;
     }
-    if (pageIndex - pageStep >= 0) {
-      goToPageIndex(pageIndex - pageStep);
+    const prevIdx = pageIndex - pageStep;
+    if (prevIdx >= 0) {
+      goToPageIndex(prevIdx);
+      if (ttsBarOpen) {
+        syncTtsToPage(prevIdx);
+      }
     }
-  }, [isPaginated, pageIndex, pageStep, goToPageIndex, viewportDim.viewportHeight]);
+  }, [
+    isPaginated,
+    pageIndex,
+    pageStep,
+    goToPageIndex,
+    viewportDim.viewportHeight,
+    ttsBarOpen,
+    syncTtsToPage,
+  ]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -519,10 +1042,23 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Ctrl/Cmd + F opens in-book full-text search
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setExportMenuOpen(false);
+        setActiveDrawer('toc');
+        setTocTab('search');
+        setTimeout(() => searchInputRef.current?.focus(), 60);
+        return;
+      }
+
       if (
         document.activeElement?.tagName === 'INPUT' ||
         document.activeElement?.tagName === 'TEXTAREA'
       ) {
+        if (e.key === 'Escape') {
+          (document.activeElement as HTMLElement)?.blur();
+        }
         return;
       }
 
@@ -532,7 +1068,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
         e.preventDefault();
         handlePrevPage();
-      } else if (e.key === 'f' || e.key === 'F') {
+      } else if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey) {
         e.preventDefault();
         onUpdateSettings({ autoFlipEnabled: !settings.autoFlipEnabled });
       } else if (e.key === '-' || e.key === '_') {
@@ -545,7 +1081,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         e.preventDefault();
         onUpdateSettings({ fontSize: 18 });
       } else if (e.key === 'Escape') {
-        if (activeDrawer !== 'none') {
+        if (ttsSettingsOpen) {
+          setTtsSettingsOpen(false);
+        } else if (activeInspectAnnotation) {
+          setActiveInspectAnnotation(null);
+        } else if (activeDrawer !== 'none') {
           setActiveDrawer('none');
         } else if (selectionState) {
           setSelectionState(null);
@@ -563,12 +1103,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     onUpdateSettings,
     settings.autoFlipEnabled,
     settings.fontSize,
+    activeInspectAnnotation,
     activeDrawer,
     selectionState,
     onBackToShelf,
   ]);
 
-  const activeOffset = virtualPages[pageIndex]?.startOffset ?? book.currentOffset;
+  const activeOffset = isPaginated
+    ? (virtualPages[pageIndex]?.startOffset ?? book.currentOffset)
+    : book.currentOffset;
 
   const currentChapterTitle = useMemo(() => {
     return findChapterTitleAtOffset(outlineHeadings, activeOffset);
@@ -625,10 +1168,28 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const text = sel.toString().trim();
     if (text.length < 2 || text.length > 600) return;
 
-    const currentStart = virtualPages[pageIndex]?.startOffset ?? book.currentOffset;
-    const foundIdx = book.content.indexOf(text, Math.max(0, currentStart - 500));
-    const finalOffset = foundIdx !== -1 ? foundIdx : currentStart;
+    // Pinpoint block start offset via [data-start-offset] attribute on paragraph DOM node
+    const anchorEl =
+      sel.anchorNode instanceof HTMLElement
+        ? sel.anchorNode
+        : sel.anchorNode?.parentElement || null;
+    const blockEl = anchorEl?.closest<HTMLElement>('[data-start-offset]');
+    const blockStartAttr = blockEl ? Number(blockEl.getAttribute('data-start-offset')) : NaN;
 
+    const fallbackStart = virtualPages[pageIndex]?.startOffset ?? book.currentOffset;
+    const searchOrigin = !Number.isNaN(blockStartAttr)
+      ? Math.max(0, blockStartAttr - 40)
+      : Math.max(0, fallbackStart - 500);
+
+    const foundIdx = book.content.indexOf(text, searchOrigin);
+    const finalOffset =
+      foundIdx !== -1
+        ? foundIdx
+        : !Number.isNaN(blockStartAttr)
+        ? blockStartAttr
+        : fallbackStart;
+
+    setActiveInspectAnnotation(null);
     setSelectionState({
       text,
       offset: finalOffset,
@@ -653,13 +1214,24 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     window.getSelection()?.removeAllRanges();
   };
 
+  const handleSaveInspectAnnotationEdit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeInspectAnnotation || !onUpdateAnnotation) return;
+    onUpdateAnnotation({
+      ...activeInspectAnnotation,
+      noteText: editAnnNote.trim(),
+      color: editAnnColor,
+    });
+    setActiveInspectAnnotation(null);
+  };
+
   const handleCanvasZoneClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (touchSwipedRef.current) {
       touchSwipedRef.current = false;
       return;
     }
-    if (scrubberVisible) {
-      setScrubberVisible(false);
+    if (activeInspectAnnotation) {
+      setActiveInspectAnnotation(null);
       return;
     }
     const sel = window.getSelection();
@@ -674,17 +1246,31 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       setExportMenuOpen(false);
       return;
     }
+    if (ttsSettingsOpen) {
+      setTtsSettingsOpen(false);
+      return;
+    }
 
     const rect = e.currentTarget.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const ratioX = clickX / rect.width;
 
     if (ratioX < 0.3) {
+      if (scrubberVisible && viewportDim.viewportWidth < 768) {
+        setScrubberVisible(false);
+      }
       handlePrevPage();
     } else if (ratioX > 0.7) {
+      if (scrubberVisible && viewportDim.viewportWidth < 768) {
+        setScrubberVisible(false);
+      }
       handleNextPage();
     } else {
-      setChromeVisible((v) => !v);
+      const nextVisible = !chromeVisible;
+      setChromeVisible(nextVisible);
+      if (viewportDim.viewportWidth < 768) {
+        setScrubberVisible(nextVisible);
+      }
     }
   };
 
@@ -761,11 +1347,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   };
 
   const getFontFamilyCss = (fontId: string): string => {
-    if (fontId === 'serif-editorial') return "'Lora', 'Noto Serif SC', 'Songti SC', serif";
-    if (fontId === 'sans-warm') return "'Plus Jakarta Sans', -apple-system, sans-serif";
-    if (fontId === 'kaiti-classic') return "'LXGW WenKai', 'Kaiti SC', 'STKaiti', 'KaiTi', serif";
-    if (fontId === 'mono-tabular') return "'JetBrains Mono', monospace";
-    return `'${fontId}', 'Noto Serif SC', serif`;
+    return resolveReaderFontFamilyCss(fontId);
   };
 
   const renderPageParagraphs = (page: VirtualPage | undefined) => {
@@ -780,35 +1362,70 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       );
     }
 
-    return page.paragraphs.map((p, idx) => {
-      const matchingAnn = annotations.find(
-        (ann) =>
-          ann.selectedText &&
-          p.text.includes(ann.selectedText.slice(0, Math.min(18, ann.selectedText.length)))
-      );
-
-      const highlightBg =
-        matchingAnn?.color === 'amber'
-          ? 'var(--highlight-amber)'
-          : matchingAnn?.color === 'sage'
-          ? 'var(--highlight-sage)'
-          : matchingAnn
-          ? 'var(--highlight-caramel)'
-          : 'transparent';
-
-      return (
-        <MarkdownBlockRenderer
-          key={`${page.pageNumber}-${idx}`}
-          block={p}
-          settings={settings}
-          highlightBg={highlightBg}
-          forceMermaidTD={forceMermaidTD}
-          mermaidContainerWidth={mermaidContainerWidth}
-          isLastBlock={idx === page.paragraphs.length - 1}
-        />
-      );
-    });
+    return page.paragraphs.map((p, idx) => (
+      <MarkdownBlockRenderer
+        key={`${page.pageNumber}-${idx}`}
+        block={p}
+        settings={settings}
+        annotations={annotations}
+        searchHighlightQuery={fullTextSearchQuery}
+        onSelectAnnotation={(ann) => {
+          setSelectionState(null);
+          setActiveInspectAnnotation(ann);
+          setEditAnnNote(ann.noteText || '');
+          setEditAnnColor(ann.color || 'amber');
+        }}
+        forceMermaidTD={forceMermaidTD}
+        mermaidContainerWidth={mermaidContainerWidth}
+        isLastBlock={idx === page.paragraphs.length - 1}
+        isTtsActive={activeTtsOffset !== null && p.startOffset === activeTtsOffset}
+        isTtsModeOpen={ttsBarOpen}
+        onClickBlockForTts={handleJumpAndSpeakAtOffset}
+      />
+    ));
   };
+
+  // Full-text search results across the entire book
+  const fullTextSearchResults = useMemo(() => {
+    const q = fullTextSearchQuery.trim();
+    if (q.length < 1) return [];
+    const lowerContent = book.content.toLowerCase();
+    const lowerQ = q.toLowerCase();
+    const results: {
+      offset: number;
+      snippet: string;
+      chapterTitle: string;
+      pageNumber: number;
+    }[] = [];
+
+    let pos = 0;
+    while (pos < lowerContent.length && results.length < 60) {
+      const idx = lowerContent.indexOf(lowerQ, pos);
+      if (idx === -1) break;
+      const snippetStart = Math.max(0, idx - 26);
+      const snippetEnd = Math.min(book.content.length, idx + q.length + 38);
+      const rawSnippet = book.content
+        .slice(snippetStart, snippetEnd)
+        .replace(/\s+/g, ' ')
+        .trim();
+      const pageIdx = findPageIndexForOffset(virtualPages, idx);
+      results.push({
+        offset: idx,
+        snippet:
+          (snippetStart > 0 ? '…' : '') +
+          rawSnippet +
+          (snippetEnd < book.content.length ? '…' : ''),
+        chapterTitle: findChapterTitleAtOffset(outlineHeadings, idx),
+        pageNumber: pageIdx + 1,
+      });
+      pos = idx + Math.max(1, q.length);
+    }
+    return results;
+  }, [book.content, fullTextSearchQuery, virtualPages, outlineHeadings]);
+
+  const maxColPx = getMaxColumnWidthPx(settings.maxColumnWidth);
+  const singlePageMaxWidthCss =
+    maxColPx !== null && maxColPx < 9000 ? `min(100%, ${maxColPx}px)` : '100%';
 
   const progressPct = useMemo(() => {
     if (isPaginated) {
@@ -839,11 +1456,54 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     [annotations]
   );
 
+  const [quickMermaidTick, setQuickMermaidTick] = useState(0);
+
+  // Sync PDF export theme & font style with the Reader's active display theme & font family
+  useEffect(() => {
+    const mappedTheme: ExportThemeStyle =
+      settings.theme === 'night' || settings.theme === 'candlelight'
+        ? 'espresso'
+        : settings.theme === 'eink'
+        ? 'eink'
+        : settings.theme === 'cream' || settings.theme === 'sandalwood'
+        ? 'caramel'
+        : 'parchment';
+    const mappedFont: 'serif' | 'kaiti' | 'sans' =
+      settings.fontFamily === 'kaiti' ||
+      settings.fontFamily === 'kaiti-classic' ||
+      /kai|楷|隶/i.test(settings.fontFamily)
+        ? 'kaiti'
+        : settings.fontFamily === 'sans' ||
+          settings.fontFamily === 'sans-warm' ||
+          /hei|sans|yahei|pingfang|黑|雅|苹/i.test(settings.fontFamily)
+        ? 'sans'
+        : 'serif';
+    setQuickPdfConfig((prev) => ({
+      ...prev,
+      themeStyle: mappedTheme,
+      fontStyle: mappedFont,
+    }));
+    warmUpCjkPdfFont(mappedFont);
+  }, [settings.theme, settings.fontFamily]);
+
+  useEffect(() => {
+    if (!book?.content) return;
+    let cancelled = false;
+    warmUpMermaidDiagramsForContent(book.content, quickPdfConfig.themeStyle)
+      .then(() => {
+        if (!cancelled) setQuickMermaidTick((t) => t + 1);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [exportMenuOpen, book.id, book.content, quickPdfConfig.themeStyle]);
+
   const quickPdfPreview = useMemo(() => {
     if (!exportMenuOpen) return null;
-    warmUpCjkPdfFont();
-    return renderJsPdfPages(book, annotations, dailyStats, quickPdfConfig, 6);
-  }, [exportMenuOpen, book, annotations, dailyStats, quickPdfConfig]);
+    warmUpCjkPdfFont(quickPdfConfig.fontStyle || 'serif');
+    return renderJsPdfPages(book, annotations, dailyStats, quickPdfConfig, Infinity);
+  }, [exportMenuOpen, book, annotations, dailyStats, quickPdfConfig, quickMermaidTick]);
 
   const handleQuickJsPdfDownload = async () => {
     const synced: ExportConfig = {
@@ -851,21 +1511,23 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       format: 'pdf',
       includeAnnotations: Boolean(quickPdfConfig.includeNotes || quickPdfConfig.includeExcerpts),
     };
-    setQuickPdfFeedback('正在嵌入中文字体生成矢量 PDF...');
+    setQuickPdfFeedback('正在渲染全书 Mermaid 图表并生成矢量 PDF...');
     const res = await exportBookWithJsPdf(book, annotations, dailyStats, synced);
-    setQuickPdfFeedback(`已生成 ${res.totalPages} 页矢量 PDF 并开始下载`);
+    setQuickPdfFeedback(`已完整生成 ${res.totalPages} 页矢量 PDF（含图表）`);
     setTimeout(() => setQuickPdfFeedback(null), 2600);
   };
 
-  const handleQuickNativePrint = () => {
+  const handleQuickNativePrint = async () => {
     const synced: ExportConfig = {
       ...quickPdfConfig,
       format: 'pdf',
       includeAnnotations: Boolean(quickPdfConfig.includeNotes || quickPdfConfig.includeExcerpts),
     };
-    const fullResult = renderJsPdfPages(book, annotations, dailyStats, synced, 120);
+    setQuickPdfFeedback('正在准备全书图表与矢量打印排版...');
+    await warmUpMermaidDiagramsForContent(book.content, synced.themeStyle);
+    const fullResult = renderJsPdfPages(book, annotations, dailyStats, synced, Infinity);
     printDocumentViaHiddenIframe(fullResult.vectorPrintHtml);
-    setQuickPdfFeedback('已唤起无页眉 A4 矢量打印');
+    setQuickPdfFeedback(`已唤起全书 ${fullResult.totalPages} 页 A4 矢量打印`);
     setTimeout(() => setQuickPdfFeedback(null), 2600);
   };
 
@@ -874,7 +1536,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       className={`relative flex h-screen w-screen flex-col overflow-hidden select-text ${
         einkFlashing ? 'eink-flash-anim' : ''
       }`}
-      style={{ backgroundColor: 'var(--bg-canvas)', color: 'var(--text-primary)' }}
+      style={{ backgroundColor: 'var(--bg-page)', color: 'var(--text-primary)' }}
       onMouseEnter={() => {
         if (settings.autoFlipEnabled) setIsAutoPausedByHover(false);
       }}
@@ -1037,6 +1699,143 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               <Play className="h-4 w-4" />
             )}
           </button>
+
+          {/* Top Toolbar Inline Read-Aloud / TTS Capsule (Never obscures book text) */}
+          {!ttsBarOpen ? (
+            <button
+              type="button"
+              onClick={() => {
+                setExportMenuOpen(false);
+                setActiveDrawer('none');
+                setTtsBarOpen(true);
+                if (ttsStatus === 'idle') {
+                  const startIdx = findInitialBlockIdxForCurrentView();
+                  speakBlockAtIndex(startIdx);
+                }
+              }}
+              className="relative flex h-9 items-center gap-1.5 rounded-xl px-2.5 text-xs font-medium transition-all"
+              style={{
+                backgroundColor: 'var(--bg-page)',
+                color: 'var(--text-primary)',
+                border: '1px solid var(--border-subtle)',
+              }}
+              title="开启智能语音朗读（支持微软晓晓/云希角色语音与本地离线语音）"
+              aria-label="智能语音朗读"
+            >
+              <Headphones className="h-4 w-4" style={{ color: 'var(--accent-primary)' }} />
+              <span className="hidden sm:inline">听书</span>
+            </button>
+          ) : (
+            <div
+              className="flex h-9 items-center gap-0.5 rounded-xl p-1 sm:gap-1"
+              style={{
+                backgroundColor: 'var(--bg-page)',
+                border: '1.5px solid var(--accent-primary)',
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                disabled={activeTtsBlockIdx === null || activeTtsBlockIdx <= 0}
+                onClick={() => {
+                  const current = activeTtsBlockIdx ?? findInitialBlockIdxForCurrentView();
+                  if (current > 0) {
+                    speakBlockAtIndex(current - 1);
+                  }
+                }}
+                className="flex h-7 w-7 items-center justify-center rounded-lg transition-opacity disabled:opacity-30"
+                style={{ color: 'var(--text-primary)' }}
+                title="上一段"
+                aria-label="上一段"
+              >
+                <SkipBack className="h-3.5 w-3.5" />
+              </button>
+
+              <button
+                type="button"
+                onClick={handleToggleTtsPlayPause}
+                className="flex h-7 w-7 items-center justify-center rounded-lg text-white transition-transform active:scale-95"
+                style={{ backgroundColor: 'var(--accent-primary)' }}
+                title={ttsStatus === 'playing' ? '暂停朗读' : '开始/继续朗读'}
+                aria-label={ttsStatus === 'playing' ? '暂停朗读' : '开始朗读'}
+              >
+                {ttsStatus === 'loading' ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : ttsStatus === 'playing' ? (
+                  <Pause className="h-3.5 w-3.5" />
+                ) : (
+                  <Play className="h-3.5 w-3.5" />
+                )}
+              </button>
+
+              <button
+                type="button"
+                disabled={
+                  activeTtsBlockIdx !== null &&
+                  activeTtsBlockIdx >= narratableBlocks.length - 1
+                }
+                onClick={() => {
+                  const current = activeTtsBlockIdx ?? findInitialBlockIdxForCurrentView();
+                  if (current + 1 < narratableBlocks.length) {
+                    speakBlockAtIndex(current + 1);
+                  }
+                }}
+                className="flex h-7 w-7 items-center justify-center rounded-lg transition-opacity disabled:opacity-30"
+                style={{ color: 'var(--text-primary)' }}
+                title="下一段"
+                aria-label="下一段"
+              >
+                <SkipForward className="h-3.5 w-3.5" />
+              </button>
+
+              {/* Voice Character & Speed Dropdown Trigger */}
+              <button
+                type="button"
+                onClick={() => {
+                  setExportMenuOpen(false);
+                  setActiveDrawer('none');
+                  setTtsSettingsOpen((v) => !v);
+                }}
+                className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px] font-medium transition-colors"
+                style={{
+                  backgroundColor: ttsSettingsOpen
+                    ? 'var(--accent-primary)'
+                    : 'var(--bg-surface)',
+                  color: ttsSettingsOpen ? '#FFFFFF' : 'var(--accent-primary)',
+                }}
+                title="选择微软角色声音 / 离线发音人及语速语调"
+              >
+                <span className="max-w-[56px] truncate sm:max-w-[76px]">
+                  {ttsEngine === 'edge'
+                    ? EDGE_NEURAL_VOICES.find((v) => v.id === ttsEdgeVoice)?.name.split(' · ')[0] ||
+                      '晓晓'
+                    : '本地'}
+                </span>
+                <span className="font-mono-tabular opacity-85">{ttsRate}x</span>
+                <ChevronDown
+                  className={`h-3 w-3 transition-transform ${
+                    ttsSettingsOpen ? 'rotate-180' : ''
+                  }`}
+                />
+              </button>
+
+              {/* Stop & Exit TTS Button */}
+              <button
+                type="button"
+                onClick={() => {
+                  stopAllTtsPlayback(true);
+                  setTtsSettingsOpen(false);
+                  setTtsBarOpen(false);
+                }}
+                className="flex h-7 w-7 items-center justify-center rounded-lg transition-colors hover:text-red-600"
+                style={{ color: 'var(--text-muted)' }}
+                title="停止朗读并退出听书"
+                aria-label="停止并退出听书"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
 
           <button
             onClick={handleToggleBookmarkAtCurrentPage}
@@ -1358,15 +2157,58 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           </div>
 
           <button
-            onClick={() => setActiveDrawer(activeDrawer === 'toc' ? 'none' : 'toc')}
+            onClick={() => {
+              setExportMenuOpen(false);
+              if (activeDrawer === 'toc' && tocTab === 'search') {
+                setActiveDrawer('none');
+              } else {
+                setActiveDrawer('toc');
+                setTocTab('search');
+                setTimeout(() => searchInputRef.current?.focus(), 60);
+              }
+            }}
             className="flex h-9 w-9 items-center justify-center rounded-xl transition-colors"
             style={{
-              backgroundColor: activeDrawer === 'toc' ? 'var(--accent-primary)' : 'var(--bg-page)',
-              color: activeDrawer === 'toc' ? '#FFFFFF' : 'var(--text-primary)',
+              backgroundColor:
+                activeDrawer === 'toc' && tocTab === 'search'
+                  ? 'var(--accent-primary)'
+                  : 'var(--bg-page)',
+              color:
+                activeDrawer === 'toc' && tocTab === 'search'
+                  ? '#FFFFFF'
+                  : 'var(--text-primary)',
               border: '1px solid var(--border-subtle)',
             }}
-            title="书签与批注列表"
-            aria-label="书签与批注"
+            title="全文检索 (Ctrl/Cmd + F)"
+            aria-label="全文检索"
+          >
+            <Search className="h-4 w-4" />
+          </button>
+
+          <button
+            onClick={() => {
+              setExportMenuOpen(false);
+              if (activeDrawer === 'toc' && tocTab !== 'search') {
+                setActiveDrawer('none');
+              } else {
+                setActiveDrawer('toc');
+                if (tocTab === 'search') setTocTab('chapters');
+              }
+            }}
+            className="flex h-9 w-9 items-center justify-center rounded-xl transition-colors"
+            style={{
+              backgroundColor:
+                activeDrawer === 'toc' && tocTab !== 'search'
+                  ? 'var(--accent-primary)'
+                  : 'var(--bg-page)',
+              color:
+                activeDrawer === 'toc' && tocTab !== 'search'
+                  ? '#FFFFFF'
+                  : 'var(--text-primary)',
+              border: '1px solid var(--border-subtle)',
+            }}
+            title="目录与批注列表"
+            aria-label="目录与批注"
           >
             <List className="h-4 w-4" />
           </button>
@@ -1496,75 +2338,34 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           onMouseUp={handleMouseUpSelection}
           onTouchStart={handleTouchStart}
           onTouchEnd={handleTouchEnd}
-          className={`relative flex flex-1 items-center justify-center overflow-hidden px-2 sm:px-10 transition-all duration-200 ${
-            chromeVisible ? 'pt-13 pb-2.5 sm:pt-14 sm:pb-14' : 'pt-13 pb-2.5 sm:py-5'
+          className={`relative flex flex-1 w-full items-stretch justify-center overflow-hidden px-0 transition-all duration-200 ${
+            chromeVisible ? 'pt-13 pb-0 md:pb-12' : 'py-0'
           }`}
         >
-          {/* Left Floating Quick Page-Turn Icon Button */}
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              handlePrevPage();
-            }}
-            disabled={!canGoPrev}
-            className=" hidden sm:flex absolute top-1/2 left-2.5 z-20 h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full opacity-70 transition-all hover:opacity-100 disabled:opacity-20"
-            style={{
-              backgroundColor: 'var(--bg-surface)',
-              color: 'var(--text-primary)',
-              border: '1px solid var(--border-subtle)',
-            }}
-            title="上一页 (←)"
-            aria-label="上一页"
-          >
-            <ChevronLeft className="h-5 w-5" />
-          </button>
-
-          {/* Right Floating Quick Page-Turn Icon Button */}
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              handleNextPage();
-            }}
-            disabled={!canGoNext}
-            className="hidden sm:flex absolute top-1/2 right-2.5 z-20 h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full opacity-70 transition-all hover:opacity-100 disabled:opacity-20"
-            style={{
-              backgroundColor: 'var(--bg-surface)',
-              color: 'var(--text-primary)',
-              border: '1px solid var(--border-subtle)',
-            }}
-            title="下一页 (→ / Space)"
-            aria-label="下一页"
-          >
-            <ChevronRight className="h-5 w-5" />
-          </button>
-
           {isPaginated ? (
             <div
-              className="paper-grain relative flex h-full w-full max-w-[1280px] flex-col justify-between overflow-hidden rounded-2xl transition-all duration-200"
+              className="relative mx-auto flex h-full w-full max-w-none flex-col justify-between overflow-hidden rounded-none border-0 shadow-none transition-all duration-200"
               style={{
+                maxWidth: '100%',
                 backgroundColor: 'var(--bg-page)',
-                border: '1px solid var(--border-subtle)',
-                boxShadow: 'var(--page-shadow)',
-                padding: `${Math.max(10, Math.min(20, Math.round(settings.pageMargin * 0.4)))}px ${Math.max(
-                  14,
-                  Math.min(settings.pageMargin, Math.floor(effectiveCanvasWidth * 0.05))
-                )}px`,
+                border: 'none',
+                boxShadow: 'none',
+                padding: isSinglePage
+                  ? `4px ${Math.max(10, Math.min(settings.pageMargin, Math.floor(effectiveCanvasWidth * 0.035)))}px`
+                  : `6px ${Math.max(12, Math.min(settings.pageMargin, Math.floor(effectiveCanvasWidth * 0.03)))}px`,
               }}
             >
               {isSpreadMode && (
                 <div
-                  className="pointer-events-none absolute top-0 bottom-0 left-1/2 z-10 w-10 -translate-x-1/2"
+                  className="pointer-events-none absolute top-0 bottom-0 left-1/2 z-10 w-6 -translate-x-1/2"
                   style={{ background: 'var(--spine-gradient)' }}
                 />
               )}
 
               {/* Top Minimal Running Header */}
               <div
-                className="flex shrink-0 items-center justify-between gap-2 border-b pb-1 text-xs"
+                className="flex shrink-0 items-center justify-between gap-2 pb-0.5 text-[11px] opacity-75"
                 style={{
-                  borderColor: 'var(--border-subtle)',
                   color: 'var(--text-muted)',
                 }}
               >
@@ -1575,28 +2376,34 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 </span>
               </div>
 
-              {/* Book Text Columns */}
+              {/* Book Text Columns: Full-width auto-centered layout in single-page mode */}
               <div
-                className={`my-1 sm:my-1.5 grid min-h-0 flex-1 overflow-hidden ${
-                  isSpreadMode ? 'grid-cols-2 gap-8 lg:gap-12' : 'mx-auto w-full max-w-3xl grid-cols-1'
+                key={pageIndex}
+                className={`reader-page-settle my-0.5 grid min-h-0 flex-1 overflow-hidden ${
+                  isSpreadMode
+                    ? 'grid-cols-2 gap-5 lg:gap-8'
+                    : 'mx-auto w-full max-w-full grid-cols-1'
                 }`}
                 style={{
+                  maxWidth: isSinglePage ? singlePageMaxWidthCss : '100%',
                   fontFamily: getFontFamilyCss(settings.fontFamily),
                   fontSize: `${settings.fontSize}px`,
                   lineHeight: settings.lineHeight,
                   letterSpacing: `${settings.letterSpacing}em`,
+                  wordBreak: 'break-word',
+                  overflowWrap: 'break-word',
                 }}
               >
                 <div
                   data-reader-column="true"
-                  className="min-w-0 overflow-x-hidden overflow-y-auto pr-0.5"
+                  className="min-w-0 w-full overflow-x-hidden overflow-y-auto pr-0.5 text-justify"
                 >
                   {renderPageParagraphs(leftPage)}
                 </div>
                 {isSpreadMode && (
                   <div
                     data-reader-column="true"
-                    className="min-w-0 overflow-x-hidden overflow-y-auto pl-0.5"
+                    className="min-w-0 w-full overflow-x-hidden overflow-y-auto pl-0.5 text-justify"
                   >
                     {renderPageParagraphs(rightPage)}
                   </div>
@@ -1605,9 +2412,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
               {/* Bottom Page Running Footer */}
               <div
-                className="flex items-center justify-between border-t pt-1 text-xs"
+                className="flex shrink-0 items-center justify-between pt-0.5 text-[11px] opacity-75"
                 style={{
-                  borderColor: 'var(--border-subtle)',
                   color: 'var(--text-muted)',
                 }}
               >
@@ -1645,25 +2451,41 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 const maxScroll = Math.max(1, el.scrollHeight - el.clientHeight);
                 const ratio = Math.min(1, Math.max(0, el.scrollTop / maxScroll));
                 const newOffset = Math.floor(ratio * book.totalChars);
+                const newPageIdx = findPageIndexForOffset(virtualPages, newOffset);
+                if (newPageIdx !== pageIndex) {
+                  setPageIndex(newPageIdx);
+                }
                 if (Math.abs(newOffset - book.currentOffset) > 120) {
-                  onUpdateBookOffset(book.id, newOffset);
+                  const charsDelta = Math.max(
+                    0,
+                    Math.min(1800, Math.abs(newOffset - lastTrackedOffsetRef.current))
+                  );
+                  lastTrackedOffsetRef.current = newOffset;
+                  onUpdateBookOffset(book.id, newOffset, 0, charsDelta);
                 }
               }}
               onTouchStart={() => setIsAutoPausedByHover(true)}
               onTouchEnd={() => setIsAutoPausedByHover(false)}
-              className="paper-grain h-full w-full max-w-4xl overflow-y-auto rounded-2xl transition-colors"
+              className="mx-auto h-full w-full max-w-none overflow-y-auto rounded-none border-0 shadow-none transition-colors"
               style={{
+                maxWidth: '100%',
                 backgroundColor: 'var(--bg-page)',
-                border: '1px solid var(--border-subtle)',
-                boxShadow: 'var(--page-shadow)',
-                padding: `40px ${settings.pageMargin}px 88px`,
+                border: 'none',
+                boxShadow: 'none',
+                padding: `12px ${Math.max(10, Math.min(settings.pageMargin, Math.floor(effectiveCanvasWidth * 0.035)))}px 64px`,
                 fontFamily: getFontFamilyCss(settings.fontFamily),
                 fontSize: `${settings.fontSize}px`,
                 lineHeight: settings.lineHeight,
                 letterSpacing: `${settings.letterSpacing}em`,
+                wordBreak: 'break-word',
+                overflowWrap: 'break-word',
               }}
             >
-              <div data-reader-column="true" className="mx-auto max-w-2xl">
+              <div
+                data-reader-column="true"
+                className="mx-auto w-full text-justify"
+                style={{ maxWidth: singlePageMaxWidthCss }}
+              >
                 {virtualPages.map((page) => (
                   <div key={page.pageNumber}>{renderPageParagraphs(page)}</div>
                 ))}
@@ -1701,7 +2523,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             min={0}
             max={Math.max(1, totalPages - 1)}
             value={pageIndex}
-            onChange={(e) => goToPageIndex(Number(e.target.value))}
+            onChange={(e) => {
+              const target = Number(e.target.value);
+              if (Math.abs(target - pageIndex) > 3 && !jumpBackState) {
+                recordJumpOrigin(pageIndex);
+              }
+              goToPageIndex(target);
+              if (ttsBarOpen) {
+                syncTtsToPage(target);
+              }
+            }}
             className="h-2 flex-1 cursor-pointer accent-[#B4532A]"
           />
           <span
@@ -1722,6 +2553,549 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           </button>
         </div>
       </footer>
+
+      {/* Subtle Toast Notification for TTS Engine Status */}
+      {ttsToast && (
+        <div className="pointer-events-none fixed top-15 left-1/2 z-50 -translate-x-1/2 px-4">
+          <div
+            className="rounded-xl px-3.5 py-1.5 text-xs font-medium shadow-lg"
+            style={{
+              backgroundColor: 'var(--bg-page)',
+              border: '1px solid var(--border-strong)',
+              color: 'var(--accent-primary)',
+            }}
+          >
+            {ttsToast}
+          </div>
+        </div>
+      )}
+
+      {/* Ultra-Compact Corner Margin Micro-Pill when Top Bar is Hidden during Immersion */}
+      {ttsBarOpen && !chromeVisible && (
+        <div
+          className="fixed top-2 right-3 z-30 flex items-center gap-1 rounded-full px-2 py-1 shadow-md backdrop-blur-md transition-opacity opacity-75 hover:opacity-100"
+          style={{
+            backgroundColor: 'var(--bg-surface)',
+            border: '1px solid var(--border-strong)',
+            color: 'var(--text-primary)',
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={handleToggleTtsPlayPause}
+            className="flex h-6 w-6 items-center justify-center rounded-full text-white"
+            style={{ backgroundColor: 'var(--accent-primary)' }}
+            title={ttsStatus === 'playing' ? '暂停朗读' : '继续朗读'}
+          >
+            {ttsStatus === 'loading' ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : ttsStatus === 'playing' ? (
+              <Pause className="h-3 w-3" />
+            ) : (
+              <Play className="h-3 w-3" />
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setChromeVisible(true);
+              setTtsSettingsOpen(true);
+            }}
+            className="flex items-center gap-1 px-1.5 text-[11px] font-medium"
+            style={{ color: 'var(--accent-primary)' }}
+            title="展开顶部听书控制与角色设置"
+          >
+            <span>
+              {ttsEngine === 'edge'
+                ? EDGE_NEURAL_VOICES.find((v) => v.id === ttsEdgeVoice)?.name.split(' · ')[0] ||
+                  '晓晓'
+                : '本地'}
+            </span>
+            <span className="font-mono-tabular">{ttsRate}x</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              stopAllTtsPlayback(true);
+              setTtsSettingsOpen(false);
+              setTtsBarOpen(false);
+            }}
+            className="flex h-5 w-5 items-center justify-center rounded-full"
+            style={{ color: 'var(--text-muted)' }}
+            title="退出听书"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      )}
+
+      {/* Top-Right Anchored Voice Character & Prosody Popover (Click-outside auto-dismisses) */}
+      {ttsBarOpen && ttsSettingsOpen && (
+        <div
+          className="fixed inset-0 z-40"
+          onClick={() => setTtsSettingsOpen(false)}
+        >
+          <aside
+            className="fixed top-14 right-3 z-50 flex max-h-[calc(100vh-4.5rem)] w-[364px] max-w-[calc(100vw-1.5rem)] flex-col space-y-3 overflow-y-auto rounded-2xl p-3.5 shadow-2xl sm:right-6 sm:p-4"
+            style={{
+              backgroundColor: 'var(--bg-page)',
+              border: '1px solid var(--border-strong)',
+              color: 'var(--text-primary)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              className="flex items-center justify-between gap-2 border-b pb-2.5"
+              style={{ borderColor: 'var(--border-subtle)' }}
+            >
+              <div className="flex items-center gap-1.5">
+                <Headphones className="h-4 w-4" style={{ color: 'var(--accent-primary)' }} />
+                <span className="font-display text-xs font-semibold">
+                  听书角色音色与语速设置
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTtsSettingsOpen(false)}
+                className="flex h-7 w-7 items-center justify-center rounded-lg"
+                style={{ color: 'var(--text-muted)' }}
+                title="收起设置面板（不中断朗读）"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Engine Switcher Tabs */}
+            <div
+              className="grid grid-cols-2 gap-1 rounded-xl p-1 text-xs"
+              style={{
+                backgroundColor: 'var(--bg-surface)',
+                border: '1px solid var(--border-subtle)',
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  onUpdateSettings({ ttsEngine: 'edge' });
+                  if (ttsStatus === 'playing' || ttsStatus === 'loading') {
+                    const idx = activeTtsBlockIdx ?? findInitialBlockIdxForCurrentView();
+                    speakBlockAtIndex(idx, { engine: 'edge' });
+                  }
+                }}
+                className="rounded-lg py-1.5 text-[11px] font-medium transition-all"
+                style={{
+                  backgroundColor:
+                    ttsEngine === 'edge' ? 'var(--accent-primary)' : 'transparent',
+                  color: ttsEngine === 'edge' ? '#FFFFFF' : 'var(--text-secondary)',
+                }}
+              >
+                微软神经网络角色 (在线)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onUpdateSettings({ ttsEngine: 'local' });
+                  if (ttsStatus === 'playing' || ttsStatus === 'loading') {
+                    const idx = activeTtsBlockIdx ?? findInitialBlockIdxForCurrentView();
+                    speakBlockAtIndex(idx, { engine: 'local' });
+                  }
+                }}
+                className="rounded-lg py-1.5 text-[11px] font-medium transition-all"
+                style={{
+                  backgroundColor:
+                    ttsEngine === 'local' ? 'var(--accent-primary)' : 'transparent',
+                  color: ttsEngine === 'local' ? '#FFFFFF' : 'var(--text-secondary)',
+                }}
+              >
+                系统原生语音 (本地离线)
+              </button>
+            </div>
+
+            {/* Voice Selection Area */}
+            <div>
+              {ttsEngine === 'edge' ? (
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between text-[11px]">
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      微软超拟真角色声音（选中后可点击空白处收起面板）
+                    </span>
+                    <span
+                      className="font-mono-tabular font-medium"
+                      style={{ color: 'var(--accent-primary)' }}
+                    >
+                      {EDGE_NEURAL_VOICES.find((v) => v.id === ttsEdgeVoice)?.name.split(' · ')[0] ||
+                        '晓晓'}
+                    </span>
+                  </div>
+                  <div className="grid max-h-48 grid-cols-2 gap-1.5 overflow-y-auto pr-0.5">
+                    {EDGE_NEURAL_VOICES.map((v) => {
+                      const active = ttsEdgeVoice === v.id;
+                      return (
+                        <button
+                          key={v.id}
+                          type="button"
+                          onClick={() => {
+                            onUpdateSettings({ ttsEdgeVoice: v.id, ttsEngine: 'edge' });
+                            if (ttsStatus === 'playing' || ttsStatus === 'loading') {
+                              const idx =
+                                activeTtsBlockIdx ?? findInitialBlockIdxForCurrentView();
+                              speakBlockAtIndex(idx, { engine: 'edge', edgeVoice: v.id });
+                            }
+                          }}
+                          className="flex flex-col items-start rounded-xl p-2 text-left transition-all"
+                          style={{
+                            backgroundColor: active
+                              ? 'var(--accent-soft)'
+                              : 'var(--bg-surface)',
+                            border: active
+                              ? '1.5px solid var(--accent-primary)'
+                              : '1px solid var(--border-subtle)',
+                          }}
+                          title={v.description}
+                        >
+                          <div className="flex w-full items-center justify-between gap-1">
+                            <span
+                              className="truncate text-xs font-semibold"
+                              style={{
+                                color: active
+                                  ? 'var(--accent-primary)'
+                                  : 'var(--text-primary)',
+                              }}
+                            >
+                              {v.name.split(' · ')[0]}
+                            </span>
+                            <span
+                              className="shrink-0 rounded px-1 py-0.5 text-[10px] font-medium"
+                              style={{
+                                backgroundColor: 'var(--bg-page)',
+                                color: 'var(--accent-primary)',
+                              }}
+                            >
+                              {v.badge}
+                            </span>
+                          </div>
+                          <span
+                            className="mt-0.5 line-clamp-1 text-[10px]"
+                            style={{ color: 'var(--text-muted)' }}
+                          >
+                            {v.roleLabel}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between text-[11px]">
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      本地系统内置发音人（断网可用，零数据外传）
+                    </span>
+                    <span className="font-mono-tabular text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                      {localVoices.length} 款可用
+                    </span>
+                  </div>
+                  <select
+                    value={ttsVoiceURI}
+                    onChange={(e) => {
+                      const nextUri = e.target.value;
+                      onUpdateSettings({ ttsVoiceURI: nextUri, ttsEngine: 'local' });
+                      if (ttsStatus === 'playing') {
+                        const idx = activeTtsBlockIdx ?? findInitialBlockIdxForCurrentView();
+                        speakBlockAtIndex(idx, {
+                          engine: 'local',
+                          localVoiceURI: nextUri,
+                        });
+                      }
+                    }}
+                    className="h-9 w-full rounded-xl px-3 text-xs outline-none"
+                    style={{
+                      backgroundColor: 'var(--bg-surface)',
+                      border: '1px solid var(--border-subtle)',
+                      color: 'var(--text-primary)',
+                    }}
+                  >
+                    <option value="">自动匹配最佳中文离线发音人（默认）</option>
+                    {localVoices.map((lv) => (
+                      <option key={lv.voice.voiceURI} value={lv.voice.voiceURI}>
+                        {lv.isOfflineLocal ? '[本地离线] ' : '[浏览器内置] '}
+                        {lv.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+
+            {/* Rate (Speed) & Pitch Controls */}
+            <div
+              className="space-y-3 rounded-xl p-3"
+              style={{
+                backgroundColor: 'var(--bg-surface)',
+                border: '1px solid var(--border-subtle)',
+              }}
+            >
+              {/* Speech Rate Control */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-medium" style={{ color: 'var(--text-secondary)' }}>
+                    朗读语速 (Rate)
+                  </span>
+                  <span
+                    className="font-mono-tabular font-semibold"
+                    style={{ color: 'var(--accent-primary)' }}
+                  >
+                    {ttsRate.toFixed(2).replace(/\.00$/, '.0').replace(/(\.\d)0$/, '$1')}x
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0.5}
+                  max={2.0}
+                  step={0.05}
+                  value={ttsRate}
+                  onChange={(e) => {
+                    const nextRate = Number(e.target.value);
+                    onUpdateSettings({ ttsRate: nextRate });
+                    if (ttsStatus === 'playing') {
+                      const idx = activeTtsBlockIdx ?? findInitialBlockIdxForCurrentView();
+                      speakBlockAtIndex(idx, { rate: nextRate });
+                    }
+                  }}
+                  className="w-full cursor-pointer accent-[#B4532A]"
+                />
+              </div>
+
+              {/* Speech Pitch Control */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-medium" style={{ color: 'var(--text-secondary)' }}>
+                    声音语调 (Pitch)
+                  </span>
+                  <span
+                    className="font-mono-tabular font-semibold"
+                    style={{ color: 'var(--accent-primary)' }}
+                  >
+                    {ttsPitch.toFixed(1)}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0.5}
+                  max={1.5}
+                  step={0.1}
+                  value={ttsPitch}
+                  onChange={(e) => {
+                    const nextPitch = Number(e.target.value);
+                    onUpdateSettings({ ttsPitch: nextPitch });
+                    if (ttsStatus === 'playing') {
+                      const idx = activeTtsBlockIdx ?? findInitialBlockIdxForCurrentView();
+                      speakBlockAtIndex(idx, { pitch: nextPitch });
+                    }
+                  }}
+                  className="w-full cursor-pointer accent-[#B4532A]"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between pt-0.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+              <span>💡 听书开启时，直接点击任意正文段落即可跳读</span>
+              <button
+                type="button"
+                onClick={() => setTtsSettingsOpen(false)}
+                className="font-medium underline"
+                style={{ color: 'var(--accent-primary)' }}
+              >
+                收起
+              </button>
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {/* Reading Position Jump-Back Pill */}
+      {jumpBackState && jumpBackState.pageIndex !== pageIndex && (
+        <div className="fixed bottom-16 left-4 z-40 sm:left-6">
+          <div
+            className="flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs shadow-lg transition-all"
+            style={{
+              backgroundColor: 'var(--bg-page)',
+              border: '1px solid var(--border-strong)',
+              color: 'var(--text-primary)',
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                const originIdx = jumpBackState.pageIndex;
+                const originOffset = jumpBackState.offset;
+                setJumpBackState(null);
+                goToPageIndex(originIdx);
+                if (ttsBarOpen) {
+                  syncTtsToPage(originIdx);
+                }
+                if (!isPaginated && scrollContainerRef.current && book.totalChars > 0) {
+                  const el = scrollContainerRef.current;
+                  const maxScroll = Math.max(1, el.scrollHeight - el.clientHeight);
+                  el.scrollTo({
+                    top: (originOffset / book.totalChars) * maxScroll,
+                    behavior: 'smooth',
+                  });
+                }
+              }}
+              className="flex items-center gap-1.5 font-medium hover:underline"
+              style={{ color: 'var(--accent-primary)' }}
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              <span className="font-mono-tabular">
+                返回跳前位置（第 {jumpBackState.pageIndex + 1} 页）
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setJumpBackState(null)}
+              className="ml-1 flex h-5 w-5 items-center justify-center rounded"
+              style={{ color: 'var(--text-muted)' }}
+              title="忽略"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Interactive Inline Highlight Inspect / Edit Popover */}
+      {activeInspectAnnotation && (
+        <div
+          className="fixed inset-x-0 bottom-16 z-50 mx-auto w-full max-w-sm px-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <form
+            onSubmit={handleSaveInspectAnnotationEdit}
+            className="rounded-2xl p-3.5 shadow-2xl"
+            style={{
+              backgroundColor: 'var(--bg-page)',
+              border: '1px solid var(--border-strong)',
+            }}
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                {(
+                  [
+                    { id: 'amber', hex: '#D97724' },
+                    { id: 'caramel', hex: '#B4532A' },
+                    { id: 'sage', hex: '#5C8060' },
+                  ] as const
+                ).map((c) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    onClick={() => {
+                      setEditAnnColor(c.id);
+                      if (onUpdateAnnotation) {
+                        onUpdateAnnotation({
+                          ...activeInspectAnnotation,
+                          color: c.id,
+                          noteText: editAnnNote.trim(),
+                        });
+                      }
+                    }}
+                    className="flex h-6 w-6 items-center justify-center rounded-full"
+                    style={{
+                      backgroundColor: c.hex,
+                      outline:
+                        editAnnColor === c.id ? '2px solid var(--text-primary)' : 'none',
+                      outlineOffset: '2px',
+                    }}
+                    title="切换荧光颜色"
+                  />
+                ))}
+                <span className="text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>
+                  已划线批注
+                </span>
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onDeleteAnnotation(activeInspectAnnotation.id);
+                    setActiveInspectAnnotation(null);
+                  }}
+                  className="flex h-7 w-7 items-center justify-center rounded-md hover:text-red-600"
+                  style={{ color: 'var(--text-muted)' }}
+                  title="删除该划线批注"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveInspectAnnotation(null)}
+                  className="flex h-7 w-7 items-center justify-center rounded-md"
+                  style={{ color: 'var(--text-muted)' }}
+                  title="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+
+            <p
+              className="mt-2 line-clamp-2 rounded-lg p-2 text-xs italic"
+              style={{
+                backgroundColor: 'var(--bg-surface)',
+                color: 'var(--text-secondary)',
+              }}
+            >
+              「{activeInspectAnnotation.selectedText}」
+            </p>
+
+            <div className="mt-2 flex gap-1.5">
+              <input
+                type="text"
+                value={editAnnNote}
+                onChange={(e) => setEditAnnNote(e.target.value)}
+                placeholder="添加或修改批注想法…"
+                className="h-8 flex-1 rounded-xl px-2.5 text-xs outline-none"
+                style={{
+                  backgroundColor: 'var(--bg-surface)',
+                  border: '1px solid var(--border-subtle)',
+                  color: 'var(--text-primary)',
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  setQuoteCardTarget({
+                    chapterTitle: activeInspectAnnotation.chapterTitle,
+                    selectedText: activeInspectAnnotation.selectedText,
+                    noteText: editAnnNote.trim(),
+                  });
+                }}
+                className="flex h-8 items-center gap-1 rounded-xl px-2.5 text-xs font-medium"
+                style={{
+                  backgroundColor: 'var(--bg-surface)',
+                  color: 'var(--accent-primary)',
+                  border: '1px solid var(--border-subtle)',
+                }}
+                title="一键生成书摘分享长图（金句卡）"
+              >
+                <ImageIcon className="h-3.5 w-3.5" />
+                <span>金句卡</span>
+              </button>
+              {onUpdateAnnotation && (
+                <button
+                  type="submit"
+                  className="h-8 rounded-xl px-3 text-xs font-medium text-white"
+                  style={{ backgroundColor: 'var(--accent-primary)' }}
+                >
+                  更新
+                </button>
+              )}
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* Compact Text Selection Highlight Popover */}
       {selectionState && (
@@ -1822,7 +3196,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         </div>
       )}
 
-      {/* Drawer 1: TOC & Annotations */}
+      {/* Drawer 1: TOC, Annotations & Full-Text Search */}
       {activeDrawer === 'toc' && (
         <div
           className="fixed inset-0 z-40 flex justify-end bg-black/40 backdrop-blur-xs"
@@ -1843,18 +3217,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               >
                 <button
                   onClick={() => setTocTab('chapters')}
-                  className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium"
+                  className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium"
                   style={{
                     backgroundColor: tocTab === 'chapters' ? 'var(--bg-page)' : 'transparent',
                     color: tocTab === 'chapters' ? 'var(--text-primary)' : 'var(--text-muted)',
                   }}
                 >
                   <List className="h-3.5 w-3.5" />
-                  <span>{outlineHeadings.length}</span>
+                  <span>目录 ({outlineHeadings.length})</span>
                 </button>
                 <button
                   onClick={() => setTocTab('annotations')}
-                  className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium"
+                  className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium"
                   style={{
                     backgroundColor:
                       tocTab === 'annotations' ? 'var(--bg-page)' : 'transparent',
@@ -1863,7 +3237,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   }}
                 >
                   <Bookmark className="h-3.5 w-3.5" />
-                  <span>{annotations.length}</span>
+                  <span>批注 ({annotations.length})</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setTocTab('search');
+                    setTimeout(() => searchInputRef.current?.focus(), 50);
+                  }}
+                  className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium"
+                  style={{
+                    backgroundColor: tocTab === 'search' ? 'var(--bg-page)' : 'transparent',
+                    color: tocTab === 'search' ? 'var(--text-primary)' : 'var(--text-muted)',
+                  }}
+                >
+                  <Search className="h-3.5 w-3.5" />
+                  <span>检索</span>
                 </button>
               </div>
 
@@ -1933,7 +3321,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   })}
                 </div>
               </>
-            ) : (
+            ) : tocTab === 'annotations' ? (
               <>
                 <div className="mt-3 flex justify-end gap-1.5">
                   <button
@@ -2031,6 +3419,108 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   )}
                 </div>
               </>
+            ) : (
+              /* Full-Text Search Tab */
+              <>
+                <div className="relative mt-3">
+                  <Search
+                    className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2"
+                    style={{ color: 'var(--text-muted)' }}
+                  />
+                  <input
+                    ref={searchInputRef}
+                    type="text"
+                    value={fullTextSearchQuery}
+                    onChange={(e) => setFullTextSearchQuery(e.target.value)}
+                    placeholder="输入关键词检索全书正文…"
+                    className="h-9 w-full rounded-xl pr-8 pl-8 text-xs outline-none"
+                    style={{
+                      backgroundColor: 'var(--bg-surface)',
+                      border: '1px solid var(--border-subtle)',
+                      color: 'var(--text-primary)',
+                    }}
+                  />
+                  {fullTextSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setFullTextSearchQuery('')}
+                      className="absolute top-1/2 right-2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded"
+                      style={{ color: 'var(--text-muted)' }}
+                      title="清空检索词"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {fullTextSearchQuery.trim() && (
+                  <div
+                    className="mt-2 flex items-center justify-between text-[11px]"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    <span>匹配结果（正文已高亮显示）</span>
+                    <span className="font-mono-tabular">
+                      {fullTextSearchResults.length}
+                      {fullTextSearchResults.length >= 60 ? '+' : ''} 处
+                    </span>
+                  </div>
+                )}
+
+                <div className="mt-2 flex-1 space-y-2 overflow-y-auto">
+                  {!fullTextSearchQuery.trim() ? (
+                    <div
+                      className="py-12 text-center text-xs"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      输入任意词句即可定位章节与页码（快捷键 Ctrl/Cmd + F）
+                    </div>
+                  ) : fullTextSearchResults.length === 0 ? (
+                    <div
+                      className="py-12 text-center text-xs"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      未找到包含「{fullTextSearchQuery}」的段落
+                    </div>
+                  ) : (
+                    fullTextSearchResults.map((res, i) => (
+                      <button
+                        key={`${res.offset}-${i}`}
+                        type="button"
+                        onClick={() => {
+                          jumpToCharOffset(res.offset);
+                          if (viewportDim.viewportWidth < 768) {
+                            setActiveDrawer('none');
+                          }
+                        }}
+                        className="w-full rounded-xl p-3 text-left transition-colors hover:opacity-90"
+                        style={{
+                          backgroundColor: 'var(--bg-surface)',
+                          border: '1px solid var(--border-subtle)',
+                        }}
+                      >
+                        <div
+                          className="flex items-center justify-between text-[11px]"
+                          style={{ color: 'var(--text-muted)' }}
+                        >
+                          <span className="truncate pr-2 font-medium">{res.chapterTitle}</span>
+                          <span
+                            className="font-mono-tabular shrink-0"
+                            style={{ color: 'var(--accent-primary)' }}
+                          >
+                            第 {res.pageNumber} 页
+                          </span>
+                        </div>
+                        <p
+                          className="mt-1 line-clamp-2 text-xs leading-relaxed"
+                          style={{ color: 'var(--text-primary)' }}
+                        >
+                          {res.snippet}
+                        </p>
+                      </button>
+                    ))
+                  )}
+                </div>
+              </>
             )}
           </aside>
         </div>
@@ -2043,7 +3533,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           onClick={() => setActiveDrawer('none')}
         >
           <aside
-            className="fixed top-14 right-3 z-50 flex max-h-[calc(100vh-4.5rem)] w-[348px] max-w-[calc(100vw-1.5rem)] flex-col space-y-4 overflow-y-auto rounded-2xl p-4 shadow-2xl sm:right-6"
+            className="fixed top-14 right-3 z-50 flex max-h-[calc(100vh-4.5rem)] w-[356px] max-w-[calc(100vw-1.5rem)] flex-col space-y-4 overflow-y-auto rounded-2xl p-4 shadow-2xl sm:right-6"
             style={{
               backgroundColor: 'var(--bg-page)',
               border: '1px solid var(--border-strong)',
@@ -2058,17 +3548,33 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               <div className="flex items-center gap-2">
                 <Sliders className="h-4 w-4" style={{ color: 'var(--accent-primary)' }} />
                 <span className="font-display text-xs font-semibold">
-                  阅读风格与字体排版（实时无遮罩预览）
+                  阅读风格与版心精调（实时预览）
                 </span>
               </div>
-              <button
-                onClick={() => setActiveDrawer('none')}
-                className="flex h-7 w-7 items-center justify-center rounded-lg"
-                style={{ color: 'var(--text-muted)' }}
-                title="关闭面板 (Esc)"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => onUpdateSettings(DEFAULT_READER_SETTINGS)}
+                  className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px] font-medium transition-colors"
+                  style={{
+                    backgroundColor: 'var(--bg-surface)',
+                    color: 'var(--text-secondary)',
+                    border: '1px solid var(--border-subtle)',
+                  }}
+                  title="恢复默认字号与排版设置"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  <span>重置</span>
+                </button>
+                <button
+                  onClick={() => setActiveDrawer('none')}
+                  className="flex h-7 w-7 items-center justify-center rounded-lg"
+                  style={{ color: 'var(--text-muted)' }}
+                  title="关闭面板 (Esc)"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
             </div>
 
             {/* 1. Paper Style & Warmth Swatches */}
@@ -2223,7 +3729,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </div>
             </div>
 
-            {/* 3. Font Family & Custom Font Upload */}
+            {/* 3. Font Family & Local Installed Font Selection */}
             <div>
               <div className="mb-2 flex items-center justify-between text-xs">
                 <span className="font-medium" style={{ color: 'var(--text-secondary)' }}>
@@ -2237,9 +3743,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                     color: 'var(--accent-primary)',
                     border: '1px solid var(--border-subtle)',
                   }}
-                  title="导入本地字体 (.ttf/.otf/.woff2)"
+                  title="导入字体文件 (.ttf/.otf/.woff2)"
                 >
-                  + 导入字体
+                  + 导入字体文件
                 </button>
               </div>
               <div className="grid grid-cols-2 gap-1.5">
@@ -2247,14 +3753,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   { id: 'serif-editorial', label: '宋体衬线' },
                   { id: 'sans-warm', label: '黑体无衬' },
                   { id: 'kaiti-classic', label: '书房楷体' },
-                  { id: 'mono-tabular', label: '等宽手稿' },
-                  ...customFonts.map((cf) => ({ id: cf.id, label: cf.name })),
                 ].map((f) => {
                   const active = settings.fontFamily === f.id;
                   return (
                     <button
                       key={f.id}
-                      onClick={() => onUpdateSettings({ fontFamily: f.id })}
+                      onClick={() => {
+                        setLocalFontPickerOpen(false);
+                        onUpdateSettings({ fontFamily: f.id });
+                      }}
                       className="min-h-[34px] truncate rounded-xl px-2.5 py-1 text-xs font-medium transition-all"
                       style={{
                         backgroundColor: active ? 'var(--accent-primary)' : 'var(--bg-surface)',
@@ -2266,10 +3773,161 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                     </button>
                   );
                 })}
+
+                {/* 4th Slot: Local Installed System Font Selector */}
+                {(() => {
+                  const isLocalActive = settings.fontFamily.startsWith('local:');
+                  const shortName = getShortLocalFontLabel(
+                    settings.fontFamily,
+                    installedLocalFonts
+                  );
+                  return (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextOpen = !localFontPickerOpen;
+                        setLocalFontPickerOpen(nextOpen);
+                        queryBrowserLocalFonts().then((list) => {
+                          setInstalledLocalFonts(list);
+                        });
+                        if (!isLocalActive && installedLocalFonts.length > 0) {
+                          onUpdateSettings({
+                            fontFamily: `local:${installedLocalFonts[0].family}`,
+                          });
+                        }
+                      }}
+                      className="flex min-h-[34px] items-center justify-center gap-1 truncate rounded-xl px-2.5 py-1 text-xs font-medium transition-all"
+                      style={{
+                        backgroundColor: isLocalActive
+                          ? 'var(--accent-primary)'
+                          : 'var(--bg-surface)',
+                        color: isLocalActive ? '#FFFFFF' : 'var(--text-primary)',
+                        border: '1px solid var(--border-subtle)',
+                      }}
+                      title="选择本机已安装的系统字体"
+                    >
+                      <span className="truncate">
+                        {isLocalActive ? `本地 · ${shortName}` : '本地已装字体'}
+                      </span>
+                      <ChevronDown className="h-3 w-3 shrink-0 opacity-80" />
+                    </button>
+                  );
+                })()}
+
+                {customFonts.map((cf) => {
+                  const active = settings.fontFamily === cf.id;
+                  return (
+                    <button
+                      key={cf.id}
+                      onClick={() => {
+                        setLocalFontPickerOpen(false);
+                        onUpdateSettings({ fontFamily: cf.id });
+                      }}
+                      className="min-h-[34px] truncate rounded-xl px-2.5 py-1 text-xs font-medium transition-all"
+                      style={{
+                        backgroundColor: active ? 'var(--accent-primary)' : 'var(--bg-surface)',
+                        color: active ? '#FFFFFF' : 'var(--text-primary)',
+                        border: '1px solid var(--border-subtle)',
+                      }}
+                    >
+                      {cf.name}
+                    </button>
+                  );
+                })}
               </div>
+
+              {/* Expandable Local Installed Font Picker Panel */}
+              {(localFontPickerOpen || settings.fontFamily.startsWith('local:')) && (
+                <div
+                  className="mt-2 rounded-xl p-2.5 space-y-2"
+                  style={{
+                    backgroundColor: 'var(--bg-surface)',
+                    border: '1px solid var(--border-subtle)',
+                  }}
+                >
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      选择本地已安装字体 ({installedLocalFonts.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        queryBrowserLocalFonts().then((list) => setInstalledLocalFonts(list));
+                      }}
+                      className="underline transition-opacity hover:opacity-80"
+                      style={{ color: 'var(--accent-primary)' }}
+                      title="扫描并读取本机安装的全部系统字体"
+                    >
+                      刷新本机字库
+                    </button>
+                  </div>
+
+                  <select
+                    value={
+                      settings.fontFamily.startsWith('local:')
+                        ? settings.fontFamily.slice('local:'.length)
+                        : installedLocalFonts[0]?.family || ''
+                    }
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val) {
+                        onUpdateSettings({ fontFamily: `local:${val}` });
+                      }
+                    }}
+                    className="w-full rounded-lg px-2.5 py-1.5 text-xs outline-none"
+                    style={{
+                      backgroundColor: 'var(--bg-page)',
+                      color: 'var(--text-primary)',
+                      border: '1px solid var(--border-subtle)',
+                    }}
+                  >
+                    {installedLocalFonts.map((lf) => (
+                      <option key={lf.family} value={lf.family}>
+                        {lf.label}
+                      </option>
+                    ))}
+                  </select>
+
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      value={customLocalFontInput}
+                      onChange={(e) => setCustomLocalFontInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && customLocalFontInput.trim()) {
+                          e.preventDefault();
+                          const fam = customLocalFontInput.trim();
+                          onUpdateSettings({ fontFamily: `local:${fam}` });
+                          setCustomLocalFontInput('');
+                        }
+                      }}
+                      placeholder="或输入本地字体名 (如: 微软雅黑 / 霞鹜文楷)"
+                      className="min-w-0 flex-1 rounded-lg px-2 py-1 text-[11px] outline-none"
+                      style={{
+                        backgroundColor: 'var(--bg-page)',
+                        color: 'var(--text-primary)',
+                        border: '1px solid var(--border-subtle)',
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const fam = customLocalFontInput.trim();
+                        if (!fam) return;
+                        onUpdateSettings({ fontFamily: `local:${fam}` });
+                        setCustomLocalFontInput('');
+                      }}
+                      className="shrink-0 rounded-lg px-2.5 py-1 text-[11px] font-medium text-white"
+                      style={{ backgroundColor: 'var(--accent-primary)' }}
+                    >
+                      应用
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
-            {/* 4. Layout Mode & Line Spacing */}
+            {/* 4. Layout Mode, Measure Width & Detailed Spacing */}
             <div className="space-y-3">
               <div className="grid grid-cols-3 gap-2">
                 {(
@@ -2285,7 +3943,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                     <button
                       key={m.id}
                       onClick={() => onUpdateSettings({ layoutMode: m.id })}
-                      className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium transition-all"
+                      className="flex min-h-[36px] items-center justify-center gap-1.5 rounded-xl px-2 py-1.5 text-xs font-medium transition-all"
                       style={{
                         backgroundColor: active ? 'var(--accent-primary)' : 'var(--bg-surface)',
                         color: active ? '#FFFFFF' : 'var(--text-primary)',
@@ -2300,24 +3958,132 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 })}
               </div>
 
-              <div className="flex items-center gap-3">
-                <AlignJustify
-                  className="h-4 w-4 shrink-0"
-                  style={{ color: 'var(--text-muted)' }}
-                />
-                <input
-                  type="range"
-                  min={1.4}
-                  max={2.2}
-                  step={0.05}
-                  value={settings.lineHeight}
-                  onChange={(e) => onUpdateSettings({ lineHeight: Number(e.target.value) })}
-                  className="flex-1 accent-[#B4532A]"
-                  title="行高"
-                />
-                <span className="font-mono-tabular w-9 text-right text-xs">
-                  {settings.lineHeight.toFixed(1)}
-                </span>
+              {/* Single-Page / Scroll Measure Width Selector */}
+              {isSinglePage && (
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between text-xs">
+                    <span className="font-medium" style={{ color: 'var(--text-secondary)' }}>
+                      单页版心宽度
+                    </span>
+                    <span className="font-mono-tabular text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                      {(settings.maxColumnWidth || 'standard') === 'narrow'
+                        ? '680px'
+                        : (settings.maxColumnWidth || 'standard') === 'standard'
+                        ? '860px'
+                        : (settings.maxColumnWidth || 'standard') === 'wide'
+                        ? '1080px'
+                        : '100%'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1.5">
+                    {(
+                      [
+                        { id: 'narrow', label: '窄版' },
+                        { id: 'standard', label: '标准' },
+                        { id: 'wide', label: '宽版' },
+                        { id: 'full', label: '全宽' },
+                      ] as { id: MaxColumnWidth; label: string }[]
+                    ).map((mw) => {
+                      const active = (settings.maxColumnWidth || 'standard') === mw.id;
+                      return (
+                        <button
+                          key={mw.id}
+                          type="button"
+                          onClick={() => onUpdateSettings({ maxColumnWidth: mw.id })}
+                          className="rounded-lg py-1.5 text-xs font-medium transition-colors"
+                          style={{
+                            backgroundColor: active ? 'var(--accent-primary)' : 'var(--bg-surface)',
+                            color: active ? '#FFFFFF' : 'var(--text-primary)',
+                            border: '1px solid var(--border-subtle)',
+                          }}
+                        >
+                          {mw.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Sliders: Line Height, Paragraph Spacing, Letter Spacing, Page Margin */}
+              <div
+                className="space-y-2.5 rounded-xl p-3 text-xs"
+                style={{
+                  backgroundColor: 'var(--bg-surface)',
+                  border: '1px solid var(--border-subtle)',
+                }}
+              >
+                <div className="flex items-center gap-2.5">
+                  <span className="w-12 shrink-0" style={{ color: 'var(--text-secondary)' }}>
+                    行距
+                  </span>
+                  <input
+                    type="range"
+                    min={1.4}
+                    max={2.2}
+                    step={0.05}
+                    value={settings.lineHeight}
+                    onChange={(e) => onUpdateSettings({ lineHeight: Number(e.target.value) })}
+                    className="flex-1 cursor-pointer accent-[#B4532A]"
+                  />
+                  <span className="font-mono-tabular w-9 text-right">
+                    {settings.lineHeight.toFixed(2)}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2.5">
+                  <span className="w-12 shrink-0" style={{ color: 'var(--text-secondary)' }}>
+                    段距
+                  </span>
+                  <input
+                    type="range"
+                    min={8}
+                    max={32}
+                    step={2}
+                    value={settings.paragraphSpacing}
+                    onChange={(e) =>
+                      onUpdateSettings({ paragraphSpacing: Number(e.target.value) })
+                    }
+                    className="flex-1 cursor-pointer accent-[#B4532A]"
+                  />
+                  <span className="font-mono-tabular w-9 text-right">
+                    {settings.paragraphSpacing}px
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2.5">
+                  <span className="w-12 shrink-0" style={{ color: 'var(--text-secondary)' }}>
+                    字距
+                  </span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={0.12}
+                    step={0.01}
+                    value={settings.letterSpacing}
+                    onChange={(e) => onUpdateSettings({ letterSpacing: Number(e.target.value) })}
+                    className="flex-1 cursor-pointer accent-[#B4532A]"
+                  />
+                  <span className="font-mono-tabular w-9 text-right">
+                    {Math.round(settings.letterSpacing * 100)}%
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2.5">
+                  <span className="w-12 shrink-0" style={{ color: 'var(--text-secondary)' }}>
+                    页边距
+                  </span>
+                  <input
+                    type="range"
+                    min={16}
+                    max={96}
+                    step={4}
+                    value={settings.pageMargin}
+                    onChange={(e) => onUpdateSettings({ pageMargin: Number(e.target.value) })}
+                    className="flex-1 cursor-pointer accent-[#B4532A]"
+                  />
+                  <span className="font-mono-tabular w-9 text-right">{settings.pageMargin}px</span>
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
